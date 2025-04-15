@@ -250,7 +250,7 @@ pub async fn insert_answer_message_with_transaction(
       message_id: row.message_id,
       content: row.content,
       created_at: row.created_at,
-      meta_data: row.meta_data,
+      metadata: row.meta_data,
       reply_message_id: Some(question_message_id),
     };
 
@@ -291,7 +291,7 @@ pub async fn insert_answer_message_with_transaction(
       message_id: row.message_id,
       content,
       created_at: row.created_at,
-      meta_data: metadata,
+      metadata,
       reply_message_id: None,
     };
 
@@ -468,7 +468,7 @@ pub async fn select_chat_messages(
             message_id,
             content,
             created_at,
-            meta_data,
+            metadata: meta_data,
             reply_message_id,
           }),
           Err(err) => {
@@ -747,7 +747,7 @@ pub async fn get_all_chat_messages<'a, E: Executor<'a, Database = Postgres>>(
           message_id: row.message_id,
           content: row.content,
           created_at: row.created_at,
-          meta_data: row.meta_data,
+          metadata: row.meta_data,
           reply_message_id: row.reply_message_id,
         }),
         Err(err) => {
@@ -882,7 +882,7 @@ pub async fn select_chat_message_matching_reply_message_id(
       message_id: row.message_id,
       content: row.content,
       created_at: row.created_at,
-      meta_data: row.meta_data,
+      metadata: row.meta_data,
       reply_message_id: row.reply_message_id,
     }),
     Err(err) => {
