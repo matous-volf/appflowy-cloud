@@ -319,7 +319,19 @@ impl ChatMessage {
       reply_message_id,
     }
   }
+
+  pub fn new_system(message_id: i64, content: String) -> Self {
+    Self {
+      author: ChatAuthor::new(message_id, ChatAuthorType::System),
+      message_id,
+      content,
+      created_at: Utc::now(),
+      metadata: json!({}),
+      reply_message_id: None,
+    }
+  }
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessageWithAuthorUuid {
   pub author: ChatAuthorWithUuid,
