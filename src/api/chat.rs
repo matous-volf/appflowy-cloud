@@ -1,3 +1,4 @@
+use crate::biz::authentication::jwt::UserUuid;
 use crate::biz::chat::ops::{
   create_chat, create_chat_message, delete_chat, generate_chat_message_answer,
   get_chat_messages_with_author_uuid, get_question_message, update_chat_message,
@@ -13,7 +14,7 @@ use appflowy_ai_client::dto::{
   ChatQuestion, ChatQuestionQuery, CreateChatContext, MessageData, QuestionMetadata,
   RepeatedRelatedQuestion,
 };
-use authentication::jwt::UserUuid;
+
 use bytes::Bytes;
 use database::chat;
 use futures::Stream;
@@ -180,6 +181,13 @@ async fn create_question_handler(
 ) -> actix_web::Result<JsonAppResponse<ChatMessageWithAuthorUuid>> {
   let (_workspace_id, chat_id) = path.into_inner();
   let params = payload.into_inner();
+
+  if let Some(ref prompt_id) = params.prompt_id {
+    state
+      .metrics
+      .ai_metrics
+      .record_prompt_usage_count(prompt_id, 1);
+  }
 
   let uid = state.user_cache.get_user_uid(&uuid).await?;
   let resp = create_chat_message(&state.pg_pool, uid, *uuid, chat_id, params).await?;

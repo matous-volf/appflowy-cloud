@@ -45,7 +45,13 @@ pub struct ResponseFormat {
   pub output_content_metadata: Option<OutputContentMetadata>,
 }
 
-#[derive(Clone, Debug, Default, Serialize_repr, Deserialize_repr)]
+impl ResponseFormat {
+  pub fn new() -> Self {
+    Self::default()
+  }
+}
+
+#[derive(Clone, Debug, Default, Serialize_repr, Deserialize_repr, Eq, PartialEq)]
 #[repr(u8)]
 pub enum OutputLayout {
   Paragraph = 0,
@@ -144,7 +150,7 @@ pub struct CompleteTextResponse {
   pub text: String,
 }
 
-#[derive(Clone, Debug, Serialize_repr, Deserialize_repr)]
+#[derive(Clone, Debug, Serialize_repr, Deserialize_repr, Eq, PartialEq, Hash)]
 #[repr(u8)]
 pub enum CompletionType {
   ImproveWriting = 1,
@@ -153,7 +159,7 @@ pub enum CompletionType {
   MakeLonger = 4,
   ContinueWriting = 5,
   Explain = 6,
-  UserQuestion = 7,
+  AskAI = 7,
   CustomPrompt = 8,
 }
 
@@ -424,6 +430,10 @@ pub struct CompletionMetadata {
   /// When completion type is 'CustomPrompt', this field should be provided.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub custom_prompt: Option<CustomPrompt>,
+  /// The id of the prompt used for the completion
+  #[serde(default)]
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub prompt_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

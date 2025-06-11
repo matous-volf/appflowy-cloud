@@ -4,10 +4,10 @@ use chrono::{DateTime, Utc};
 
 use database_entity::dto::{
   AFAccessLevel, AFRole, AFUserProfile, AFWebUser, AFWebUserWithObfuscatedName, AFWorkspace,
-  AFWorkspaceInvitationStatus, AccessRequestMinimal, AccessRequestStatus, AccessRequestWithViewId,
-  AccessRequesterInfo, AccountLink, GlobalComment, QuickNote, Reaction, Template, TemplateCategory,
-  TemplateCategoryMinimal, TemplateCategoryType, TemplateCreator, TemplateCreatorMinimal,
-  TemplateGroup, TemplateMinimal,
+  AFWorkspaceInvitationStatus, AFWorkspaceMember, AccessRequestMinimal, AccessRequestStatus,
+  AccessRequestWithViewId, AccessRequesterInfo, AccountLink, GlobalComment, QuickNote, Reaction,
+  Template, TemplateCategory, TemplateCategoryMinimal, TemplateCategoryType, TemplateCreator,
+  TemplateCreatorMinimal, TemplateGroup, TemplateMinimal,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
@@ -186,6 +186,18 @@ pub struct AFWorkspaceMemberRow {
   pub created_at: Option<DateTime<Utc>>,
 }
 
+impl From<AFWorkspaceMemberRow> for AFWorkspaceMember {
+  fn from(value: AFWorkspaceMemberRow) -> Self {
+    AFWorkspaceMember {
+      name: value.name.clone(),
+      email: value.email.clone(),
+      role: value.role.clone(),
+      avatar_url: value.avatar_url.clone(),
+      joined_at: value.created_at,
+    }
+  }
+}
+
 #[derive(FromRow)]
 pub struct AFCollabMemberAccessLevelRow {
   pub uid: i64,
@@ -291,9 +303,18 @@ pub struct AFWorkspaceInvitationMinimal {
 pub struct AFCollabRowMeta {
   pub oid: String,
   pub workspace_id: Uuid,
-
+  pub owner_uid: i64,
   pub deleted_at: Option<DateTime<Utc>>,
   pub created_at: Option<DateTime<Utc>>,
+  pub updated_at: DateTime<Utc>,
+}
+
+#[derive(FromRow, Clone, Debug)]
+pub struct AFCollabData {
+  pub oid: Uuid,
+  pub partition_key: i32,
+  pub updated_at: DateTime<Utc>,
+  pub blob: Vec<u8>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

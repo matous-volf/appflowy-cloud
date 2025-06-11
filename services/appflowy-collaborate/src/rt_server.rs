@@ -3,12 +3,10 @@ use std::time::Duration;
 
 use crate::client::client_msg_router::ClientMessageRouter;
 use crate::command::{spawn_collaboration_command, CLCommandReceiver};
-use crate::config::get_env_var;
 use crate::connect_state::ConnectState;
 use crate::error::{CreateGroupFailedReason, RealtimeError};
 use crate::group::cmd::{GroupCommand, GroupCommandRunner, GroupCommandSender};
 use crate::group::manager::GroupManager;
-use crate::rt_server::collaboration_runtime::COLLAB_RUNTIME;
 use access_control::collab::RealtimeAccessControl;
 use anyhow::{anyhow, Result};
 use app_error::AppError;
@@ -25,7 +23,7 @@ use redis::aio::ConnectionManager;
 use tokio::sync::mpsc::Sender;
 use tokio::task::yield_now;
 use tokio::time::interval;
-use tracing::{error, info, trace, warn};
+use tracing::{error, trace, warn};
 use uuid::Uuid;
 use yrs::updates::decoder::Decode;
 use yrs::StateVector;
@@ -41,7 +39,6 @@ pub struct CollaborationServer<S> {
   group_sender_by_object_id: Arc<DashMap<Uuid, GroupCommandSender>>,
   #[allow(dead_code)]
   metrics: Arc<CollabRealtimeMetrics>,
-  enable_custom_runtime: bool,
 }
 
 impl<S> CollaborationServer<S>
@@ -58,19 +55,8 @@ where
     awareness_gossip: Arc<AwarenessGossip>,
     redis_connection_manager: ConnectionManager,
     group_persistence_interval: Duration,
-    prune_grace_period: Duration,
     indexer_scheduler: Arc<IndexerScheduler>,
   ) -> Result<Self, RealtimeError> {
-    let enable_custom_runtime = get_env_var("APPFLOWY_COLLABORATE_MULTI_THREAD", "false")
-      .parse::<bool>()
-      .unwrap_or(false);
-
-    if enable_custom_runtime {
-      info!("CollaborationServer with custom runtime");
-    } else {
-      info!("CollaborationServer with actix-web runtime");
-    }
-
     let connect_state = ConnectState::new();
     let collab_stream = CollabRedisStream::new_with_connection_manager(
       redis_connection_manager,
@@ -84,7 +70,6 @@ where
         metrics.clone(),
         collab_stream,
         group_persistence_interval,
-        prune_grace_period,
         indexer_scheduler.clone(),
       )
       .await?,
@@ -105,7 +90,6 @@ where
       connect_state,
       group_sender_by_object_id,
       metrics,
-      enable_custom_runtime,
     })
   }
 
@@ -127,6 +111,7 @@ where
       .handle_user_connect(connected_user, new_client_router)
     {
       // Remove the old user from all collaboration groups.
+      trace!("[realtime] remove old user: {}", old_user);
       self.group_manager.remove_user(&old_user);
     }
     self
@@ -337,12 +322,7 @@ where
           };
 
           let object_id = *entry.key();
-          if self.enable_custom_runtime {
-            COLLAB_RUNTIME.spawn(runner.run(object_id));
-          } else {
-            tokio::spawn(runner.run(object_id));
-          }
-
+          tokio::spawn(runner.run(object_id));
           entry.insert(new_sender.clone());
           new_sender
         },
@@ -379,11 +359,7 @@ where
   }
 
   pub fn get_user_by_device(&self, user_device: &UserDevice) -> Option<RealtimeUser> {
-    self
-      .connect_state
-      .user_by_device
-      .get(user_device)
-      .map(|entry| entry.value().clone())
+    self.connect_state.get_user_by_device(user_device)
   }
 }
 
@@ -412,30 +388,4 @@ fn spawn_period_check_inactive_group<S>(
       }
     }
   });
-}
-
-/// When the CollaborationServer operates within an actix-web actor, utilizing tokio::spawn for
-/// task execution confines all tasks to the same thread, attributable to the actor's reliance on a
-/// single-threaded Tokio runtime. To circumvent this limitation and enable task execution across
-/// multiple threads, we've incorporated a multi-thread feature.
-///
-/// When appflowy-collaborate is deployed as a standalone service, we can use tokio multi-thread.
-mod collaboration_runtime {
-  use std::io;
-
-  use lazy_static::lazy_static;
-  use tokio::runtime;
-  use tokio::runtime::Runtime;
-
-  lazy_static! {
-    pub(crate) static ref COLLAB_RUNTIME: Runtime = default_tokio_runtime().unwrap();
-  }
-
-  pub fn default_tokio_runtime() -> io::Result<Runtime> {
-    runtime::Builder::new_multi_thread()
-      .thread_name("collab-rt")
-      .enable_io()
-      .enable_time()
-      .build()
-  }
 }

@@ -112,6 +112,8 @@ pub struct BlobMetadata {
 #[derive(Serialize, Deserialize)]
 pub struct CreateWorkspaceParam {
   pub workspace_name: Option<String>,
+  #[serde(default)]
+  pub workspace_icon: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -203,11 +205,31 @@ pub struct CreatePageParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateOrphanedViewParams {
+  pub document_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdatePageParams {
   pub name: String,
   pub icon: Option<ViewIcon>,
   pub is_locked: Option<bool>,
   pub extra: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatePageNameParams {
+  pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatePageIconParams {
+  pub icon: ViewIcon,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatePageExtraParams {
+  pub extra: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

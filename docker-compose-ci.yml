@@ -48,9 +48,6 @@ services:
       - POSTGRES_DB=${POSTGRES_DB:-postgres}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
       - POSTGRES_HOST=${POSTGRES_HOST:-postgres}
-      - SUPABASE_PASSWORD=${SUPABASE_PASSWORD:-root}
-    volumes:
-      - ./migrations/before:/docker-entrypoint-initdb.d
     networks:
       - shared_network
 
@@ -80,7 +77,7 @@ services:
       - GOTRUE_ADMIN_PASSWORD=${GOTRUE_ADMIN_PASSWORD}
       - GOTRUE_DISABLE_SIGNUP=${GOTRUE_DISABLE_SIGNUP:-false}
       - GOTRUE_SITE_URL=appflowy-flutter://                           # redirected to AppFlowy application
-      - URI_ALLOW_LIST=*                                              # adjust restrict if necessary
+      - GOTRUE_URI_ALLOW_LIST=**                                      # adjust restrict if necessary
       - GOTRUE_JWT_SECRET=${GOTRUE_JWT_SECRET}                        # authentication secret
       - GOTRUE_JWT_EXP=${GOTRUE_JWT_EXP}
       # Without this environment variable, the createuser command will create an admin
@@ -180,6 +177,8 @@ services:
     networks:
       - shared_network
     depends_on:
+      gotrue:
+        condition: service_healthy
       appflowy_cloud:
         condition: service_started
 
@@ -190,7 +189,6 @@ services:
       - "5001:5001"
     environment:
       - OPENAI_API_KEY=${AI_OPENAI_API_KEY}
-      - ANTHROPIC_API_KEY=${AI_ANTHROPIC_API_KEY}
       - AI_AWS_ACCESS_KEY_ID=${APPFLOWY_S3_ACCESS_KEY}
       - AI_AWS_SECRET_ACCESS_KEY=${APPFLOWY_S3_SECRET_KEY}
       - AI_APPFLOWY_BUCKET_NAME=${AI_APPFLOWY_BUCKET_NAME}
@@ -201,6 +199,7 @@ services:
       - AI_MINIO_URL=${AI_MINIO_URL}
       - AI_APPFLOWY_HOST=${AI_APPFLOWY_HOST}
       - SUPPORT_OPENAI_V3_IMAGE_MODEL=false
+      - LOG_LEVEL=DEBUG
     networks:
       - shared_network
 

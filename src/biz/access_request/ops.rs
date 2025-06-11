@@ -11,6 +11,7 @@ use access_control::workspace::WorkspaceAccessControl;
 use anyhow::Context;
 use app_error::AppError;
 use appflowy_collaborate::collab::storage::CollabAccessControlStorage;
+use collab::core::collab::default_client_id;
 use database::{
   access_request::{
     insert_new_access_request, select_access_request_by_request_id, update_access_request_status,
@@ -85,6 +86,7 @@ pub async fn get_access_request(
     collab_storage,
     GetCollabOrigin::Server,
     access_request_with_view_id.workspace.workspace_id,
+    default_client_id(),
   )
   .await?;
   let view = folder.get_view(&access_request_with_view_id.view_id.to_string());
@@ -122,7 +124,7 @@ pub async fn approve_or_reject_access_request(
 ) -> Result<(), AppError> {
   let access_request = select_access_request_by_request_id(pg_pool, request_id).await?;
   workspace_access_control
-    .enforce_role(&uid, &access_request.workspace.workspace_id, AFRole::Owner)
+    .enforce_role_strong(&uid, &access_request.workspace.workspace_id, AFRole::Owner)
     .await?;
 
   let mut txn = pg_pool.begin().await.context("approving request")?;
