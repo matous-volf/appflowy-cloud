@@ -518,8 +518,13 @@ pub async fn select_workspace_member_list(
   let members = sqlx::query_as!(
     AFWorkspaceMemberRow,
     r#"
-    SELECT af_user.uid, af_user.name, af_user.email,
-    af_workspace_member.role_id AS role
+    SELECT
+      af_user.uid,
+      af_user.name,
+      af_user.email,
+      af_user.metadata ->> 'icon_url' AS avatar_url,
+      af_workspace_member.role_id AS role,
+      af_workspace_member.created_at
     FROM public.af_workspace_member
         JOIN public.af_user ON af_workspace_member.uid = af_user.uid
     WHERE af_workspace_member.workspace_id = $1
@@ -541,7 +546,13 @@ pub async fn select_workspace_member<'a, E: Executor<'a, Database = Postgres>>(
   let member = sqlx::query_as!(
     AFWorkspaceMemberRow,
     r#"
-    SELECT af_user.uid, af_user.name, af_user.email, af_workspace_member.role_id AS role
+    SELECT
+      af_user.uid,
+      af_user.name,
+      af_user.email,
+      af_user.metadata ->> 'icon_url' AS avatar_url,
+      af_workspace_member.role_id AS role,
+      af_workspace_member.created_at
     FROM public.af_workspace_member
       JOIN public.af_user ON af_workspace_member.uid = af_user.uid
     WHERE af_workspace_member.workspace_id = $1
@@ -564,7 +575,13 @@ pub async fn select_workspace_member_by_uuid<'a, E: Executor<'a, Database = Post
   let member = sqlx::query_as!(
     AFWorkspaceMemberRow,
     r#"
-    SELECT af_user.uid, af_user.name, af_user.email, af_workspace_member.role_id AS role
+    SELECT
+      af_user.uid,
+      af_user.name,
+      af_user.email,
+      af_user.metadata ->> 'icon_url' AS avatar_url,
+      af_workspace_member.role_id AS role,
+      af_workspace_member.created_at
     FROM public.af_workspace_member
       JOIN public.af_user ON af_workspace_member.uid = af_user.uid
     WHERE af_workspace_member.workspace_id = $1
@@ -1546,7 +1563,7 @@ pub async fn select_invitation_code_info<'a, E: Executor<'a, Database = Postgres
         FROM af_workspace_invite_code
         JOIN af_workspace_member USING (workspace_id)
         WHERE invite_code = $1
-        AND (expires_at IS NULL OR expires_at < NOW())
+        AND (expires_at IS NULL OR expires_at > NOW())
         GROUP BY invite_code
       )
       SELECT

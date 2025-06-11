@@ -154,6 +154,17 @@ pub struct CollabResponse {
   pub object_id: Uuid,
 }
 
+/// Create a view in the folder, without an associated collab
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateFolderViewParams {
+  pub parent_view_id: Uuid,
+  pub layout: ViewLayout,
+  pub name: Option<String>,
+  pub view_id: Option<Uuid>,
+  // If database id is provided, then the view will be added to the workspace database collab
+  pub database_id: Option<Uuid>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Space {
   pub view_id: Uuid,
@@ -345,6 +356,17 @@ pub enum IconType {
   Emoji = 0,
   Url = 1,
   Icon = 2,
+}
+
+impl From<u8> for IconType {
+  fn from(value: u8) -> Self {
+    match value {
+      0 => IconType::Emoji,
+      1 => IconType::Url,
+      2 => IconType::Icon,
+      _ => IconType::Emoji,
+    }
+  }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
