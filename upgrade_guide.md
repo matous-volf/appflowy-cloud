@@ -13,7 +13,7 @@
 
 5. Push to the origin.
 
-6. On the server, pull form the origin.
+6. On the server, pull from the origin.
 
 7. Update the Docker image version variables in the .env file.
 
