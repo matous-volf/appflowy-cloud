@@ -6,7 +6,7 @@
 
 3. Fetch the tags from the upstream by
     ```
-    git fetch --tags
+    git fetch --tags upstream
     ```
    
 4. Merge the new version's tag into the `selfhosted` branch (ideally in an IDE).
