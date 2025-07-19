@@ -42,10 +42,9 @@ use collab_user::core::UserAwareness;
 
 // Database entity imports
 use database_entity::dto::{
-  AFCollabEmbedInfo, AFRole, AFSnapshotMeta, AFSnapshotMetas, AFUserProfile, AFUserWorkspaceInfo,
-  AFWorkspace, AFWorkspaceInvitationStatus, AFWorkspaceMember, BatchQueryCollabResult,
-  CollabParams, CreateCollabParams, QueryCollab, QueryCollabParams, QuerySnapshotParams,
-  SnapshotData,
+  AFCollabEmbedInfo, AFRole, AFUserProfile, AFUserWorkspaceInfo, AFWorkspace,
+  AFWorkspaceInvitationStatus, AFWorkspaceMember, BatchQueryCollabResult, CollabParams,
+  CreateCollabParams, QueryCollab, QueryCollabParams,
 };
 
 // Shared entity imports
@@ -64,9 +63,7 @@ use crate::user::{generate_unique_registered_user, User};
 use crate::{assertion_utils, load_env, localhost_client_with_device_id, setup_log};
 
 // New module imports
-use crate::assertion_utils::{
-  assert_server_collab_eventually, assert_server_snapshot_eventually, JsonAssertable,
-};
+use crate::assertion_utils::{assert_server_collab_eventually, JsonAssertable};
 use crate::async_utils::retry_api_with_constant_interval;
 use crate::test_client_config::{RetryConfig, TestClientConstants};
 use crate::workspace_ops::WorkspaceManager;
@@ -214,10 +211,11 @@ impl TestClient {
     view_id: &str,
     view_name: &str,
     view_layout: ViewLayout,
+    uid: i64,
   ) {
     let mut folder = self.get_folder(*workspace_id).await;
     let general_space_id = folder
-      .get_view(&workspace_id.to_string())
+      .get_view(&workspace_id.to_string(), uid)
       .unwrap()
       .children
       .first()
@@ -231,7 +229,7 @@ impl TestClient {
       .view;
     {
       let mut txn = folder.collab.transact_mut();
-      folder.body.views.insert(&mut txn, view, None);
+      folder.body.views.insert(&mut txn, view, None, uid);
     }
     let folder_collab_type = CollabType::Folder;
     self
@@ -265,7 +263,6 @@ impl TestClient {
       .unwrap()
       .encode_collab;
     Folder::from_collab_doc_state(
-      uid,
       CollabOrigin::Client(CollabClient::new(uid, self.device_id.clone())),
       folder_collab.into(),
       &workspace_id.to_string(),
@@ -276,12 +273,12 @@ impl TestClient {
 
   pub async fn get_database(&self, workspace_id: Uuid, database_id: &str) -> Database {
     let client_id = self.client_id(&workspace_id).await;
-    let service = TestDatabaseCollabService {
-      api_client: self.api_client.clone(),
+    let service = Arc::new(TestDatabaseCollabService::new(
+      self.api_client.clone(),
       workspace_id,
       client_id,
-    };
-    let context = DatabaseContext::new(Arc::new(service));
+    ));
+    let context = DatabaseContext::new(service.clone(), service);
     Database::open(database_id, context).await.unwrap()
   }
 
@@ -364,7 +361,6 @@ impl TestClient {
   }
 
   pub async fn get_user_folder(&self) -> Folder {
-    let uid = self.uid().await;
     let workspace_id = self.workspace_id().await;
     let data = self
       .api_client
@@ -377,7 +373,6 @@ impl TestClient {
       .unwrap();
 
     Folder::from_collab_doc_state(
-      uid,
       CollabOrigin::Empty,
       data.encode_collab.into(),
       &workspace_id.to_string(),
@@ -760,76 +755,6 @@ impl TestClient {
     );
   }
 
-  pub async fn get_snapshot(
-    &self,
-    workspace_id: &Uuid,
-    object_id: &Uuid,
-    snapshot_id: &i64,
-  ) -> Result<SnapshotData, AppResponseError> {
-    self
-      .api_client
-      .get_snapshot(
-        workspace_id,
-        object_id,
-        QuerySnapshotParams {
-          snapshot_id: *snapshot_id,
-        },
-      )
-      .await
-  }
-
-  pub async fn create_snapshot(
-    &self,
-    workspace_id: &Uuid,
-    object_id: &Uuid,
-    collab_type: CollabType,
-  ) -> Result<AFSnapshotMeta, AppResponseError> {
-    self
-      .api_client
-      .create_snapshot(workspace_id, object_id, collab_type)
-      .await
-  }
-
-  pub async fn get_snapshot_list(
-    &self,
-    workspace_id: &Uuid,
-    object_id: &Uuid,
-  ) -> Result<AFSnapshotMetas, AppResponseError> {
-    self
-      .api_client
-      .get_snapshot_list(workspace_id, object_id)
-      .await
-  }
-
-  /// Gets snapshot list and waits until a condition is met
-  pub async fn get_snapshot_list_until(
-    &self,
-    workspace_id: &Uuid,
-    object_id: &Uuid,
-    condition: impl Fn(&AFSnapshotMetas) -> bool + Send + Sync + 'static,
-    timeout_secs: u64,
-  ) -> Result<AFSnapshotMetas, AppResponseError> {
-    retry_api_with_constant_interval(
-      || async {
-        let snapshot_metas = self.get_snapshot_list(workspace_id, object_id).await?;
-        if condition(&snapshot_metas) {
-          Ok(snapshot_metas)
-        } else {
-          Err(AppResponseError {
-            code: shared_entity::response::ErrorCode::RecordNotFound,
-            message: "Snapshot condition not met yet".into(),
-          })
-        }
-      },
-      RetryConfig {
-        timeout: Duration::from_secs(timeout_secs),
-        poll_interval: Duration::from_secs(TestClientConstants::SNAPSHOT_POLL_INTERVAL_SECS),
-        max_retries: (timeout_secs / TestClientConstants::SNAPSHOT_POLL_INTERVAL_SECS) as u32,
-      },
-    )
-    .await
-  }
-
   pub async fn create_collab_list(
     &mut self,
     workspace_id: &Uuid,
@@ -1179,31 +1104,6 @@ impl TestClient {
   }
 }
 
-/// Asserts that a server snapshot eventually matches the expected JSON
-///
-/// This is a convenience function that uses the new assertion utilities.
-/// Consider using `assert_server_snapshot_eventually` directly for more control.
-pub async fn assert_server_snapshot(
-  client: &client_api::Client,
-  workspace_id: &Uuid,
-  object_id: &Uuid,
-  snapshot_id: &i64,
-  expected: Value,
-) {
-  assert_server_snapshot_eventually(
-    client,
-    workspace_id,
-    object_id,
-    *snapshot_id,
-    expected,
-    crate::test_client_config::AssertionConfig::default(),
-  )
-  .await
-  .unwrap_or_else(|e| panic!("Server snapshot assertion failed: {}", e));
-}
-
-/// Asserts that a server collab eventually matches the expected JSON
-///
 /// This is a convenience function that uses the new assertion utilities.
 /// Consider using `assert_server_collab_eventually` directly for more control.
 pub async fn assert_server_collab(

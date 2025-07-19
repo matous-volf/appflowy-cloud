@@ -6,7 +6,7 @@ use crate::biz::authentication::jwt::{Authorization, OptionalUserUuid, UserUuid}
 use crate::biz::collab::ops::{
   get_user_favorite_folder_views, get_user_recent_folder_views, get_user_trash_folder_views,
 };
-use crate::biz::collab::utils::collab_from_doc_state;
+use crate::biz::collab::utils::{collab_from_doc_state, DUMMY_UID};
 use crate::biz::workspace;
 use crate::biz::workspace::duplicate::duplicate_view_tree_and_collab;
 use crate::biz::workspace::invite::{
@@ -15,7 +15,8 @@ use crate::biz::workspace::invite::{
 };
 use crate::biz::workspace::ops::{
   create_comment_on_published_view, create_reaction_on_comment, get_comments_on_published_view,
-  get_reactions_on_published_view, remove_comment_on_published_view, remove_reaction_on_comment,
+  get_reactions_on_published_view, get_workspace_owner, remove_comment_on_published_view,
+  remove_reaction_on_comment,
 };
 use crate::biz::workspace::page_view::{
   add_recent_pages, append_block_at_the_end_of_page, create_database_view, create_folder_view,
@@ -59,7 +60,6 @@ use collab_rt_entity::realtime_proto::HttpRealtimeMessage;
 use collab_rt_entity::user::RealtimeUser;
 use collab_rt_entity::RealtimeMessage;
 use collab_rt_protocol::collab_from_encode_collab;
-use database::collab::{CollabStorage, GetCollabOrigin};
 use database::user::select_uid_from_email;
 use database_entity::dto::PublishCollabItem;
 use database_entity::dto::PublishInfo;
@@ -69,6 +69,7 @@ use itertools::Itertools;
 use prost::Message as ProstMessage;
 use rayon::prelude::*;
 
+use semver::Version;
 use sha2::{Digest, Sha256};
 use shared_entity::dto::publish_dto::DuplicatePublishedPageResponse;
 use shared_entity::dto::workspace_dto::*;
@@ -278,15 +279,6 @@ pub fn workspace_scope() -> Scope {
       web::resource("/{workspace_id}/usage").route(web::get().to(get_workspace_usage_handler)),
     )
     .service(
-      web::resource("/{workspace_id}/{object_id}/snapshot")
-        .route(web::get().to(get_collab_snapshot_handler))
-        .route(web::post().to(create_collab_snapshot_handler)),
-    )
-    .service(
-      web::resource("/{workspace_id}/{object_id}/snapshot/list")
-        .route(web::get().to(get_all_collab_snapshot_list_handler)),
-    )
-    .service(
       web::resource("/published/{publish_namespace}")
         .route(web::get().to(get_default_published_collab_info_meta_handler)),
     )
@@ -421,19 +413,18 @@ async fn create_workspace_handler(
   state: Data<AppState>,
   create_workspace_param: Json<CreateWorkspaceParam>,
 ) -> Result<Json<AppResponse<AFWorkspace>>> {
+  let uid = state.user_cache.get_user_uid(&uuid).await?;
   let create_workspace_param = create_workspace_param.into_inner();
-
   let workspace_name = create_workspace_param
     .workspace_name
     .unwrap_or_else(|| format!("workspace_{}", chrono::Utc::now().timestamp()));
 
   let workspace_icon = create_workspace_param.workspace_icon.unwrap_or_default();
-
-  let uid = state.user_cache.get_user_uid(&uuid).await?;
   let new_workspace = workspace::ops::create_workspace_for_user(
     &state.pg_pool,
     state.workspace_access_control.clone(),
-    &state.collab_access_control_storage,
+    &state.collab_storage,
+    &state.metrics.collab_metrics,
     &uuid,
     uid,
     &workspace_name,
@@ -480,6 +471,7 @@ async fn delete_workspace_handler(
     .await?;
   workspace::ops::delete_workspace_for_user(
     state.pg_pool.clone(),
+    state.redis_connection_manager.clone(),
     workspace_id,
     state.bucket_storage.clone(),
   )
@@ -493,8 +485,14 @@ async fn list_workspace_handler(
   uuid: UserUuid,
   state: Data<AppState>,
   query: web::Query<QueryWorkspaceParam>,
+  req: HttpRequest,
 ) -> Result<JsonAppResponse<Vec<AFWorkspace>>> {
-  let exclude_guest = true;
+  let app_version = client_version_from_headers(req.headers())
+    .ok()
+    .and_then(|s| Version::parse(s).ok());
+  let exclude_guest = app_version
+    .map(|s| s < Version::new(0, 9, 4))
+    .unwrap_or(true);
   let QueryWorkspaceParam {
     include_member_count,
     include_role,
@@ -653,11 +651,12 @@ async fn get_workspace_members_handler(
     .enforce_role_weak(&uid, &workspace_id, AFRole::Guest)
     .await?;
   let requester_member_info =
-    workspace::ops::get_workspace_member(&uid, &state.pg_pool, &workspace_id).await?;
+    workspace::ops::get_workspace_member(uid, &state.pg_pool, &workspace_id).await?;
   let members: Vec<AFWorkspaceMember> = if requester_member_info.role == AFRole::Guest {
-    vec![requester_member_info.into()]
+    let owner = get_workspace_owner(&state.pg_pool, &workspace_id).await?;
+    vec![requester_member_info.into(), owner.into()]
   } else {
-    workspace::ops::get_workspace_members(&state.pg_pool, &workspace_id)
+    workspace::ops::get_workspace_members_exclude_guest(&state.pg_pool, &workspace_id)
       .await?
       .into_iter()
       .map(|member| member.into())
@@ -711,7 +710,7 @@ async fn get_workspace_member_handler(
     .workspace_access_control
     .enforce_role_weak(&uid, &workspace_id, AFRole::Member)
     .await?;
-  let member_row = workspace::ops::get_workspace_member(&member_uid, &state.pg_pool, &workspace_id)
+  let member_row = workspace::ops::get_workspace_member(member_uid, &state.pg_pool, &workspace_id)
     .await
     .map_err(|_| {
       AppResponseError::new(
@@ -782,7 +781,8 @@ async fn open_workspace_handler(
     .workspace_access_control
     .enforce_action(&uid, &workspace_id, Action::Read)
     .await?;
-  let workspace = workspace::ops::open_workspace(&state.pg_pool, &user_uuid, &workspace_id).await?;
+  let workspace =
+    workspace::ops::open_workspace(&state.pg_pool, &user_uuid, uid, &workspace_id).await?;
   Ok(AppResponse::Ok().with_data(workspace).into())
 }
 
@@ -921,7 +921,7 @@ async fn create_collab_handler(
 
   let action = format!("Create new collab: {}", params);
   state
-    .collab_access_control_storage
+    .collab_storage
     .upsert_new_collab_with_transaction(workspace_id, &uid, params, &mut transaction, &action)
     .await?;
 
@@ -1067,7 +1067,7 @@ async fn batch_create_collab_handler(
 
   let start = Instant::now();
   state
-    .collab_access_control_storage
+    .collab_storage
     .batch_insert_new_collab(workspace_id, &uid, collab_params_list)
     .await?;
 
@@ -1099,16 +1099,25 @@ async fn get_collab_handler(
     .await
     .map_err(AppResponseError::from)?;
   let params = payload.into_inner();
-  let object_id = params.object_id;
+  params
+    .validate()
+    .map_err(|err| AppError::InvalidRequest(err.to_string()))?;
+
   let encode_collab = state
-    .collab_access_control_storage
-    .get_encode_collab(GetCollabOrigin::User { uid }, params, true)
+    .collab_storage
+    .get_full_encode_collab(
+      uid.into(),
+      &params.workspace_id,
+      &params.object_id,
+      params.collab_type,
+    )
     .await
-    .map_err(AppResponseError::from)?;
+    .map_err(AppResponseError::from)?
+    .encoded_collab;
 
   let resp = CollabResponse {
     encode_collab,
-    object_id,
+    object_id: params.object_id,
   };
 
   Ok(Json(AppResponse::Ok().with_data(resp)))
@@ -1127,19 +1136,12 @@ async fn v1_get_collab_handler(
     .await
     .map_err(AppResponseError::from)?;
 
-  let param = QueryCollabParams {
-    workspace_id,
-    inner: QueryCollab {
-      object_id,
-      collab_type: query.collab_type,
-    },
-  };
-
   let encode_collab = state
-    .collab_access_control_storage
-    .get_encode_collab(GetCollabOrigin::User { uid }, param, true)
+    .collab_storage
+    .get_full_encode_collab(uid.into(), &workspace_id, &object_id, query.collab_type)
     .await
-    .map_err(AppResponseError::from)?;
+    .map_err(AppResponseError::from)?
+    .encoded_collab;
 
   let resp = CollabResponse {
     encode_collab,
@@ -1149,6 +1151,7 @@ async fn v1_get_collab_handler(
   Ok(Json(AppResponse::Ok().with_data(resp)))
 }
 
+#[instrument(level = "trace", skip_all)]
 async fn get_collab_json_handler(
   user_uuid: UserUuid,
   path: web::Path<(Uuid, Uuid)>,
@@ -1163,19 +1166,12 @@ async fn get_collab_json_handler(
     .await
     .map_err(AppResponseError::from)?;
 
-  let param = QueryCollabParams {
-    workspace_id,
-    inner: QueryCollab {
-      object_id,
-      collab_type,
-    },
-  };
-
   let doc_state = state
-    .collab_access_control_storage
-    .get_encode_collab(GetCollabOrigin::User { uid }, param, true)
+    .collab_storage
+    .get_full_encode_collab(uid.into(), &workspace_id, &object_id, collab_type)
     .await
     .map_err(AppResponseError::from)?
+    .encoded_collab
     .doc_state;
   let collab = collab_from_doc_state(doc_state.to_vec(), &object_id, default_client_id())?;
 
@@ -1192,7 +1188,6 @@ async fn post_web_update_handler(
   path: web::Path<(Uuid, Uuid)>,
   payload: Json<UpdateCollabWebParams>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
   req: HttpRequest,
 ) -> Result<Json<AppResponse<()>>> {
   let uid = state
@@ -1212,8 +1207,7 @@ async fn post_web_update_handler(
   let collab_type = payload.collab_type;
 
   update_page_collab_data(
-    &state.metrics.appflowy_web_metrics,
-    server,
+    &state,
     user,
     workspace_id,
     object_id,
@@ -1229,18 +1223,14 @@ async fn post_space_handler(
   path: web::Path<Uuid>,
   payload: Json<CreateSpaceParams>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
   req: HttpRequest,
 ) -> Result<Json<AppResponse<Space>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   let workspace_uuid = path.into_inner();
   let user = realtime_user_for_web_request(req.headers(), uid)?;
   let space = create_space(
-    &state.metrics.appflowy_web_metrics,
-    server,
+    &state,
     user,
-    &state.pg_pool,
-    &state.collab_access_control_storage,
     workspace_uuid,
     &payload.space_permission,
     &payload.name,
@@ -1257,17 +1247,15 @@ async fn update_space_handler(
   path: web::Path<(Uuid, String)>,
   payload: Json<UpdateSpaceParams>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   req: HttpRequest,
 ) -> Result<Json<AppResponse<Space>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   let (workspace_uuid, view_id) = path.into_inner();
   let user = realtime_user_for_web_request(req.headers(), uid)?;
   update_space(
-    &state.metrics.appflowy_web_metrics,
-    server,
+    &state,
     user,
-    &state.collab_access_control_storage,
     workspace_uuid,
     &view_id,
     &payload.space_permission,
@@ -1284,18 +1272,15 @@ async fn post_folder_view_handler(
   path: web::Path<Uuid>,
   payload: Json<CreateFolderViewParams>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   req: HttpRequest,
 ) -> Result<Json<AppResponse<Page>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   let workspace_uuid = path.into_inner();
   let user = realtime_user_for_web_request(req.headers(), uid)?;
   let page = create_folder_view(
-    &state.metrics.appflowy_web_metrics,
-    server,
+    &state,
     user,
-    &state.collab_access_control_storage,
-    &state.pg_pool,
     workspace_uuid,
     &payload.parent_view_id,
     payload.layout.clone(),
@@ -1312,18 +1297,14 @@ async fn post_page_view_handler(
   path: web::Path<Uuid>,
   payload: Json<CreatePageParams>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
   req: HttpRequest,
 ) -> Result<Json<AppResponse<Page>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   let workspace_uuid = path.into_inner();
   let user = realtime_user_for_web_request(req.headers(), uid)?;
   let page = create_page(
-    &state.metrics.appflowy_web_metrics,
-    server,
+    &state,
     user,
-    &state.pg_pool,
-    &state.collab_access_control_storage,
     workspace_uuid,
     &payload.parent_view_id,
     &payload.layout,
@@ -1347,7 +1328,7 @@ async fn post_orphaned_view_handler(
   create_orphaned_view(
     uid,
     &state.pg_pool,
-    &state.collab_access_control_storage,
+    &state.collab_storage,
     workspace_uuid,
     payload.document_id,
   )
@@ -1360,7 +1341,7 @@ async fn append_block_to_page_handler(
   path: web::Path<(Uuid, String)>,
   payload: Json<AppendBlockToPageParams>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   req: HttpRequest,
 ) -> Result<Json<AppResponse<()>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
@@ -1376,16 +1357,7 @@ async fn append_block_to_page_handler(
   let serde_blocks = serde_blocks
     .into_iter()
     .collect::<Result<Vec<SerdeBlock>, AppError>>()?;
-  append_block_at_the_end_of_page(
-    &state.metrics.appflowy_web_metrics,
-    server,
-    user,
-    &state.collab_access_control_storage,
-    workspace_uuid,
-    &view_id,
-    &serde_blocks,
-  )
-  .await?;
+  append_block_at_the_end_of_page(&state, user, workspace_uuid, &view_id, &serde_blocks).await?;
   Ok(Json(AppResponse::Ok()))
 }
 
@@ -1394,17 +1366,15 @@ async fn move_page_handler(
   path: web::Path<(Uuid, String)>,
   payload: Json<MovePageParams>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   req: HttpRequest,
 ) -> Result<Json<AppResponse<()>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   let (workspace_uuid, view_id) = path.into_inner();
   let user = realtime_user_for_web_request(req.headers(), uid)?;
   move_page(
-    &state.metrics.appflowy_web_metrics,
-    server,
+    &state,
     user,
-    &state.collab_access_control_storage,
     workspace_uuid,
     &view_id,
     &payload.new_parent_view_id,
@@ -1419,17 +1389,15 @@ async fn reorder_favorite_page_handler(
   path: web::Path<(Uuid, String)>,
   payload: Json<ReorderFavoritePageParams>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   req: HttpRequest,
 ) -> Result<Json<AppResponse<()>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   let (workspace_uuid, view_id) = path.into_inner();
   let user = realtime_user_for_web_request(req.headers(), uid)?;
   reorder_favorite_page(
-    &state.metrics.appflowy_web_metrics,
-    server,
+    &state,
     user,
-    &state.collab_access_control_storage,
     workspace_uuid,
     &view_id,
     payload.prev_view_id.as_deref(),
@@ -1443,24 +1411,14 @@ async fn duplicate_page_handler(
   path: web::Path<(Uuid, Uuid)>,
   payload: Json<DuplicatePageParams>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   req: HttpRequest,
 ) -> Result<Json<AppResponse<()>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   let (workspace_uuid, view_id) = path.into_inner();
   let user = realtime_user_for_web_request(req.headers(), uid)?;
   let suffix = payload.suffix.as_deref().unwrap_or(" (Copy)").to_string();
-  duplicate_view_tree_and_collab(
-    &state.metrics.appflowy_web_metrics,
-    server,
-    user,
-    state.collab_access_control_storage.clone(),
-    &state.pg_pool,
-    workspace_uuid,
-    view_id,
-    &suffix,
-  )
-  .await?;
+  duplicate_view_tree_and_collab(&state, user, workspace_uuid, view_id, &suffix).await?;
   Ok(Json(AppResponse::Ok()))
 }
 
@@ -1468,21 +1426,13 @@ async fn move_page_to_trash_handler(
   user_uuid: UserUuid,
   path: web::Path<(Uuid, String)>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   req: HttpRequest,
 ) -> Result<Json<AppResponse<()>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   let (workspace_uuid, view_id) = path.into_inner();
   let user = realtime_user_for_web_request(req.headers(), uid)?;
-  move_page_to_trash(
-    &state.metrics.appflowy_web_metrics,
-    server,
-    user,
-    &state.collab_access_control_storage,
-    workspace_uuid,
-    &view_id,
-  )
-  .await?;
+  move_page_to_trash(&state, user, workspace_uuid, &view_id).await?;
   Ok(Json(AppResponse::Ok()))
 }
 
@@ -1490,21 +1440,13 @@ async fn restore_page_from_trash_handler(
   user_uuid: UserUuid,
   path: web::Path<(Uuid, String)>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   req: HttpRequest,
 ) -> Result<Json<AppResponse<()>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   let (workspace_uuid, view_id) = path.into_inner();
   let user = realtime_user_for_web_request(req.headers(), uid)?;
-  restore_page_from_trash(
-    &state.metrics.appflowy_web_metrics,
-    server,
-    user,
-    &state.collab_access_control_storage,
-    workspace_uuid,
-    &view_id,
-  )
-  .await?;
+  restore_page_from_trash(&state, user, workspace_uuid, &view_id).await?;
   Ok(Json(AppResponse::Ok()))
 }
 
@@ -1513,22 +1455,14 @@ async fn add_recent_pages_handler(
   path: web::Path<Uuid>,
   payload: Json<AddRecentPagesParams>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   req: HttpRequest,
 ) -> Result<Json<AppResponse<()>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   let workspace_uuid = path.into_inner();
   let user = realtime_user_for_web_request(req.headers(), uid)?;
   let AddRecentPagesParams { recent_view_ids } = payload.into_inner();
-  add_recent_pages(
-    &state.metrics.appflowy_web_metrics,
-    server,
-    user,
-    &state.collab_access_control_storage,
-    workspace_uuid,
-    recent_view_ids,
-  )
-  .await?;
+  add_recent_pages(&state, user, workspace_uuid, recent_view_ids).await?;
   Ok(Json(AppResponse::Ok()))
 }
 
@@ -1536,20 +1470,13 @@ async fn restore_all_pages_from_trash_handler(
   user_uuid: UserUuid,
   path: web::Path<Uuid>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   req: HttpRequest,
 ) -> Result<Json<AppResponse<()>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   let workspace_uuid = path.into_inner();
   let user = realtime_user_for_web_request(req.headers(), uid)?;
-  restore_all_pages_from_trash(
-    &state.metrics.appflowy_web_metrics,
-    server,
-    user,
-    &state.collab_access_control_storage,
-    workspace_uuid,
-  )
-  .await?;
+  restore_all_pages_from_trash(&state, user, workspace_uuid).await?;
   Ok(Json(AppResponse::Ok()))
 }
 
@@ -1557,7 +1484,7 @@ async fn delete_page_from_trash_handler(
   user_uuid: UserUuid,
   path: web::Path<(Uuid, String)>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   req: HttpRequest,
 ) -> Result<Json<AppResponse<()>>> {
   let uid = state
@@ -1571,15 +1498,7 @@ async fn delete_page_from_trash_handler(
     .enforce_action(&uid, &workspace_id, Action::Write)
     .await?;
   let user = realtime_user_for_web_request(req.headers(), uid)?;
-  delete_trash(
-    &state.metrics.appflowy_web_metrics,
-    server,
-    user,
-    &state.collab_access_control_storage,
-    workspace_id,
-    &view_id,
-  )
-  .await?;
+  delete_trash(&state, user, workspace_id, &view_id).await?;
   Ok(Json(AppResponse::Ok()))
 }
 
@@ -1587,7 +1506,7 @@ async fn delete_all_pages_from_trash_handler(
   user_uuid: UserUuid,
   path: web::Path<Uuid>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   req: HttpRequest,
 ) -> Result<Json<AppResponse<()>>> {
   let uid = state
@@ -1601,17 +1520,11 @@ async fn delete_all_pages_from_trash_handler(
     .enforce_action(&uid, &workspace_id, Action::Write)
     .await?;
   let user = realtime_user_for_web_request(req.headers(), uid)?;
-  delete_all_pages_from_trash(
-    &state.metrics.appflowy_web_metrics,
-    server,
-    user,
-    &state.collab_access_control_storage,
-    workspace_id,
-  )
-  .await?;
+  delete_all_pages_from_trash(&state, user, workspace_id).await?;
   Ok(Json(AppResponse::Ok()))
 }
 
+#[instrument(level = "trace", skip_all)]
 async fn publish_page_handler(
   user_uuid: UserUuid,
   path: web::Path<(Uuid, Uuid)>,
@@ -1635,9 +1548,7 @@ async fn publish_page_handler(
     duplicate_enabled,
   } = payload.into_inner();
   publish_page(
-    &state.pg_pool,
-    &state.collab_access_control_storage,
-    state.published_collab_store.as_ref(),
+    &state,
     uid,
     *user_uuid,
     workspace_id,
@@ -1681,18 +1592,15 @@ async fn post_page_database_view_handler(
   path: web::Path<(Uuid, Uuid)>,
   payload: Json<CreatePageDatabaseViewParams>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   req: HttpRequest,
 ) -> Result<Json<AppResponse<()>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   let user = realtime_user_for_web_request(req.headers(), uid)?;
   let (workspace_uuid, view_id) = path.into_inner();
   create_database_view(
-    &state.metrics.appflowy_web_metrics,
-    server,
+    &state,
     user,
-    &state.pg_pool,
-    &state.collab_access_control_storage,
     workspace_uuid,
     &view_id,
     &payload.layout,
@@ -1707,7 +1615,7 @@ async fn update_page_view_handler(
   path: web::Path<(Uuid, String)>,
   payload: Json<UpdatePageParams>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   req: HttpRequest,
 ) -> Result<Json<AppResponse<()>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
@@ -1720,10 +1628,8 @@ async fn update_page_view_handler(
     .map(|json_value| json_value.to_string());
   let user = realtime_user_for_web_request(req.headers(), uid)?;
   update_page(
-    &state.metrics.appflowy_web_metrics,
-    server,
+    &state,
     user,
-    &state.collab_access_control_storage,
     workspace_uuid,
     &view_id,
     &payload.name,
@@ -1740,22 +1646,13 @@ async fn update_page_name_handler(
   path: web::Path<(Uuid, String)>,
   payload: Json<UpdatePageNameParams>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   req: HttpRequest,
 ) -> Result<Json<AppResponse<()>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   let (workspace_uuid, view_id) = path.into_inner();
   let user = realtime_user_for_web_request(req.headers(), uid)?;
-  update_page_name(
-    &state.metrics.appflowy_web_metrics,
-    server,
-    user,
-    &state.collab_access_control_storage,
-    workspace_uuid,
-    &view_id,
-    &payload.name,
-  )
-  .await?;
+  update_page_name(&state, user, workspace_uuid, &view_id, &payload.name).await?;
   Ok(Json(AppResponse::Ok()))
 }
 
@@ -1764,23 +1661,14 @@ async fn update_page_icon_handler(
   path: web::Path<(Uuid, String)>,
   payload: Json<UpdatePageIconParams>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   req: HttpRequest,
 ) -> Result<Json<AppResponse<()>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   let (workspace_uuid, view_id) = path.into_inner();
   let icon = &payload.icon;
   let user = realtime_user_for_web_request(req.headers(), uid)?;
-  update_page_icon(
-    &state.metrics.appflowy_web_metrics,
-    server,
-    user,
-    &state.collab_access_control_storage,
-    workspace_uuid,
-    &view_id,
-    Some(icon),
-  )
-  .await?;
+  update_page_icon(&state, user, workspace_uuid, &view_id, Some(icon)).await?;
   Ok(Json(AppResponse::Ok()))
 }
 
@@ -1789,22 +1677,13 @@ async fn update_page_extra_handler(
   path: web::Path<(Uuid, String)>,
   payload: Json<UpdatePageExtraParams>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   req: HttpRequest,
 ) -> Result<Json<AppResponse<()>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   let (workspace_uuid, view_id) = path.into_inner();
   let user = realtime_user_for_web_request(req.headers(), uid)?;
-  update_page_extra(
-    &state.metrics.appflowy_web_metrics,
-    server,
-    user,
-    &state.collab_access_control_storage,
-    workspace_uuid,
-    &view_id,
-    &payload.extra,
-  )
-  .await?;
+  update_page_extra(&state, user, workspace_uuid, &view_id, &payload.extra).await?;
   Ok(Json(AppResponse::Ok()))
 }
 
@@ -1812,22 +1691,13 @@ async fn remove_page_icon_handler(
   user_uuid: UserUuid,
   path: web::Path<(Uuid, String)>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   req: HttpRequest,
 ) -> Result<Json<AppResponse<()>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   let (workspace_uuid, view_id) = path.into_inner();
   let user = realtime_user_for_web_request(req.headers(), uid)?;
-  update_page_icon(
-    &state.metrics.appflowy_web_metrics,
-    server,
-    user,
-    &state.collab_access_control_storage,
-    workspace_uuid,
-    &view_id,
-    None,
-  )
-  .await?;
+  update_page_icon(&state, user, workspace_uuid, &view_id, None).await?;
   Ok(Json(AppResponse::Ok()))
 }
 
@@ -1845,7 +1715,8 @@ async fn get_page_view_handler(
 
   let page_collab = get_page_view_collab(
     &state.pg_pool,
-    &state.collab_access_control_storage,
+    &state.collab_storage,
+    &state.ws_server,
     uid,
     workspace_uuid,
     view_id,
@@ -1859,17 +1730,15 @@ async fn favorite_page_view_handler(
   path: web::Path<(Uuid, String)>,
   payload: Json<FavoritePageParams>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   req: HttpRequest,
 ) -> Result<Json<AppResponse<()>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   let (workspace_uuid, view_id) = path.into_inner();
   let user = realtime_user_for_web_request(req.headers(), uid)?;
   favorite_page(
-    &state.metrics.appflowy_web_metrics,
-    server,
+    &state,
     user,
-    &state.collab_access_control_storage,
     workspace_uuid,
     &view_id,
     payload.is_favorite,
@@ -1877,74 +1746,6 @@ async fn favorite_page_view_handler(
   )
   .await?;
   Ok(Json(AppResponse::Ok()))
-}
-
-#[instrument(level = "trace", skip_all, err)]
-async fn get_collab_snapshot_handler(
-  payload: Json<QuerySnapshotParams>,
-  path: web::Path<(Uuid, Uuid)>,
-  state: Data<AppState>,
-) -> Result<Json<AppResponse<SnapshotData>>> {
-  let (workspace_id, object_id) = path.into_inner();
-  let data = state
-    .collab_access_control_storage
-    .get_collab_snapshot(workspace_id, object_id, &payload.snapshot_id)
-    .await
-    .map_err(AppResponseError::from)?;
-
-  Ok(Json(AppResponse::Ok().with_data(data)))
-}
-
-#[instrument(level = "trace", skip_all, err)]
-async fn create_collab_snapshot_handler(
-  user_uuid: UserUuid,
-  state: Data<AppState>,
-  path: web::Path<(Uuid, Uuid)>,
-  payload: Json<CollabType>,
-) -> Result<Json<AppResponse<AFSnapshotMeta>>> {
-  let (workspace_id, object_id) = path.into_inner();
-  let collab_type = payload.into_inner();
-  let uid = state
-    .user_cache
-    .get_user_uid(&user_uuid)
-    .await
-    .map_err(AppResponseError::from)?;
-  let data = state
-    .collab_access_control_storage
-    .get_encode_collab(
-      GetCollabOrigin::User { uid },
-      QueryCollabParams::new(object_id, collab_type, workspace_id),
-      true,
-    )
-    .await?
-    .doc_state;
-
-  let meta = state
-    .collab_access_control_storage
-    .create_snapshot(InsertSnapshotParams {
-      object_id,
-      workspace_id,
-      doc_state: data,
-      collab_type,
-    })
-    .await?;
-
-  Ok(Json(AppResponse::Ok().with_data(meta)))
-}
-
-#[instrument(level = "trace", skip(path, state), err)]
-async fn get_all_collab_snapshot_list_handler(
-  _user_uuid: UserUuid,
-  path: web::Path<(Uuid, Uuid)>,
-  state: Data<AppState>,
-) -> Result<Json<AppResponse<AFSnapshotMetas>>> {
-  let (workspace_id, object_id) = path.into_inner();
-  let data = state
-    .collab_access_control_storage
-    .get_collab_snapshot_list(&workspace_id, &object_id)
-    .await
-    .map_err(AppResponseError::from)?;
-  Ok(Json(AppResponse::Ok().with_data(data)))
 }
 
 #[instrument(level = "debug", skip(payload, state), err)]
@@ -1962,8 +1763,8 @@ async fn batch_get_collab_handler(
     .map_err(AppResponseError::from)?;
   let result = BatchQueryCollabResult(
     state
-      .collab_access_control_storage
-      .batch_get_collab(&uid, workspace_id, payload.into_inner().0, false)
+      .collab_storage
+      .batch_get_collab(&uid, workspace_id, payload.into_inner().0)
       .await,
   );
   Ok(Json(AppResponse::Ok().with_data(result)))
@@ -2026,8 +1827,8 @@ async fn update_collab_handler(
   }
 
   state
-    .collab_access_control_storage
-    .queue_insert_or_update_collab(workspace_id, &uid, params, false)
+    .collab_storage
+    .upsert_collab_background(workspace_id, &uid, params)
     .await?;
   Ok(AppResponse::Ok().into())
 }
@@ -2048,7 +1849,7 @@ async fn delete_collab_handler(
     .map_err(AppResponseError::from)?;
 
   state
-    .collab_access_control_storage
+    .collab_storage
     .delete_collab(&payload.workspace_id, &uid, &payload.object_id)
     .await
     .map_err(AppResponseError::from)?;
@@ -2192,9 +1993,7 @@ async fn post_published_duplicate_handler(
   let params = params.into_inner();
   let root_view_id_for_duplicate =
     biz::workspace::publish_dup::duplicate_published_collab_to_workspace(
-      &state.pg_pool,
-      state.bucket_client.clone(),
-      state.collab_access_control_storage.clone(),
+      &state,
       uid,
       params.published_view_id,
       workspace_id,
@@ -2213,10 +2012,12 @@ async fn list_published_collab_info_handler(
   workspace_id: web::Path<Uuid>,
   state: Data<AppState>,
 ) -> Result<Json<AppResponse<Vec<PublishInfoView>>>> {
+  let uid = DUMMY_UID;
   let publish_infos = biz::workspace::publish::list_collab_publish_info(
     state.published_collab_store.as_ref(),
-    &state.collab_access_control_storage,
+    &state.ws_server,
     workspace_id.into_inner(),
+    uid,
   )
   .await?;
 
@@ -2340,6 +2141,7 @@ async fn delete_published_collab_reaction_handler(
 // FIXME: This endpoint currently has a different behaviour from the publish page endpoint,
 // as it doesn't accept parameters. We will need to deprecate this endpoint and use a new
 // one that accepts parameters.
+#[instrument(level = "trace", skip_all)]
 async fn post_publish_collabs_handler(
   workspace_id: web::Path<Uuid>,
   user_uuid: UserUuid,
@@ -2500,7 +2302,7 @@ async fn get_workspace_folder_handler(
   user_uuid: UserUuid,
   workspace_id: web::Path<Uuid>,
   state: Data<AppState>,
-  server: Data<RealtimeServerAddr>,
+
   query: web::Query<QueryWorkspaceFolder>,
   req: HttpRequest,
 ) -> Result<Json<AppResponse<FolderView>>> {
@@ -2508,16 +2310,15 @@ async fn get_workspace_folder_handler(
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   let user = realtime_user_for_web_request(req.headers(), uid)?;
   let workspace_id = workspace_id.into_inner();
+  // shuheng: AppFlowy Web does not support guest editor yet, so we need to make sure
+  // that the user is at least a member of the workspace, not just a guest.
   state
     .workspace_access_control
-    .enforce_action(&uid, &workspace_id, Action::Read)
+    .enforce_role_weak(&uid, &workspace_id, AFRole::Member)
     .await?;
   let root_view_id = query.root_view_id.unwrap_or(workspace_id);
   let folder_view = biz::collab::ops::get_user_workspace_structure(
-    &state.metrics.appflowy_web_metrics,
-    server,
-    &state.collab_access_control_storage,
-    &state.pg_pool,
+    &state,
     user,
     workspace_id,
     depth,
@@ -2538,13 +2339,8 @@ async fn get_recent_views_handler(
     .workspace_access_control
     .enforce_action(&uid, &workspace_id, Action::Read)
     .await?;
-  let folder_views = get_user_recent_folder_views(
-    &state.collab_access_control_storage,
-    &state.pg_pool,
-    uid,
-    workspace_id,
-  )
-  .await?;
+  let folder_views =
+    get_user_recent_folder_views(&state.ws_server, &state.pg_pool, uid, workspace_id).await?;
   let section_items = RecentSectionItems {
     views: folder_views,
   };
@@ -2562,13 +2358,8 @@ async fn get_favorite_views_handler(
     .workspace_access_control
     .enforce_action(&uid, &workspace_id, Action::Read)
     .await?;
-  let folder_views = get_user_favorite_folder_views(
-    &state.collab_access_control_storage,
-    &state.pg_pool,
-    uid,
-    workspace_id,
-  )
-  .await?;
+  let folder_views =
+    get_user_favorite_folder_views(&state.ws_server, &state.pg_pool, uid, workspace_id).await?;
   let section_items = FavoriteSectionItems {
     views: folder_views,
   };
@@ -2586,8 +2377,7 @@ async fn get_trash_views_handler(
     .workspace_access_control
     .enforce_action(&uid, &workspace_id, Action::Read)
     .await?;
-  let folder_views =
-    get_user_trash_folder_views(&state.collab_access_control_storage, uid, workspace_id).await?;
+  let folder_views = get_user_trash_folder_views(&state.ws_server, uid, workspace_id).await?;
   let section_items = TrashSectionItems {
     views: folder_views,
   };
@@ -2598,10 +2388,12 @@ async fn get_workspace_publish_outline_handler(
   publish_namespace: web::Path<String>,
   state: Data<AppState>,
 ) -> Result<Json<AppResponse<PublishedView>>> {
+  let uid = DUMMY_UID;
   let published_view = biz::collab::ops::get_published_view(
-    &state.collab_access_control_storage,
+    &state.ws_server,
     publish_namespace.into_inner(),
     &state.pg_pool,
+    uid,
   )
   .await?;
   Ok(Json(AppResponse::Ok().with_data(published_view)))
@@ -2616,7 +2408,8 @@ async fn list_database_handler(
   let workspace_id = workspace_id.into_inner();
   let dbs = biz::collab::ops::list_database(
     &state.pg_pool,
-    &state.collab_access_control_storage,
+    &state.ws_server,
+    &state.collab_storage,
     uid,
     workspace_id,
   )
@@ -2637,12 +2430,8 @@ async fn list_database_row_id_handler(
     .enforce_action(&uid, &workspace_id, Action::Read)
     .await?;
 
-  let db_rows = biz::collab::ops::list_database_row_ids(
-    &state.collab_access_control_storage,
-    workspace_id,
-    db_id,
-  )
-  .await?;
+  let db_rows =
+    biz::collab::ops::list_database_row_ids(&state.collab_storage, workspace_id, db_id).await?;
   Ok(Json(AppResponse::Ok().with_data(db_rows)))
 }
 
@@ -2661,17 +2450,9 @@ async fn post_database_row_handler(
 
   let AddDatatabaseRow { cells, document } = add_database_row.into_inner();
 
-  let new_db_row_id = biz::collab::ops::insert_database_row(
-    state.collab_access_control_storage.clone(),
-    &state.pg_pool,
-    workspace_id,
-    db_id,
-    uid,
-    None,
-    cells,
-    document,
-  )
-  .await?;
+  let new_db_row_id =
+    biz::collab::ops::insert_database_row(&state, workspace_id, db_id, uid, None, cells, document)
+      .await?;
   Ok(Json(AppResponse::Ok().with_data(new_db_row_id)))
 }
 
@@ -2707,17 +2488,8 @@ async fn put_database_row_handler(
     ])
   };
 
-  biz::collab::ops::upsert_database_row(
-    state.collab_access_control_storage.clone(),
-    &state.pg_pool,
-    workspace_id,
-    db_id,
-    uid,
-    row_id,
-    cells,
-    document,
-  )
-  .await?;
+  biz::collab::ops::upsert_database_row(&state, workspace_id, db_id, uid, row_id, cells, document)
+    .await?;
   Ok(Json(AppResponse::Ok().with_data(row_id.to_string())))
 }
 
@@ -2733,12 +2505,8 @@ async fn get_database_fields_handler(
     .enforce_action(&uid, &workspace_id, Action::Read)
     .await?;
 
-  let db_fields = biz::collab::ops::get_database_fields(
-    &state.collab_access_control_storage,
-    workspace_id,
-    db_id,
-  )
-  .await?;
+  let db_fields =
+    biz::collab::ops::get_database_fields(&state.collab_storage, workspace_id, db_id).await?;
 
   Ok(Json(AppResponse::Ok().with_data(db_fields)))
 }
@@ -2756,15 +2524,8 @@ async fn post_database_fields_handler(
     .enforce_action(&uid, &workspace_id, Action::Write)
     .await?;
 
-  let field_id = biz::collab::ops::add_database_field(
-    uid,
-    state.collab_access_control_storage.clone(),
-    &state.pg_pool,
-    workspace_id,
-    db_id,
-    field.into_inner(),
-  )
-  .await?;
+  let field_id =
+    biz::collab::ops::add_database_field(&state, workspace_id, db_id, field.into_inner()).await?;
 
   Ok(Json(AppResponse::Ok().with_data(field_id)))
 }
@@ -2789,7 +2550,7 @@ async fn list_database_row_id_updated_handler(
     .unwrap_or_else(|| Utc::now() - Duration::hours(1));
 
   let db_rows = biz::collab::ops::list_database_row_ids_updated(
-    &state.collab_access_control_storage,
+    &state.collab_storage,
     &state.pg_pool,
     workspace_id,
     db_id,
@@ -2819,7 +2580,7 @@ async fn list_database_row_details_handler(
   static UNSUPPORTED_FIELD_TYPES: &[FieldType] = &[FieldType::Relation];
 
   let db_rows = biz::collab::ops::list_database_row_details(
-    &state.collab_access_control_storage,
+    &state.collab_storage,
     uid,
     workspace_id,
     db_id,

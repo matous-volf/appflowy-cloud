@@ -13,11 +13,11 @@ use client_api_entity::CollabType;
 use collab::core::collab_state::{InitState, State, SyncState};
 use collab::preclude::Collab;
 use collab_rt_protocol::{CollabRef, WeakCollabRef};
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use shared_entity::response::AppResponseError;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter, Write};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicBool;
@@ -26,13 +26,13 @@ use std::time::Duration;
 use tokio::select;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
-use tokio::time::MissedTickBehavior;
+use tokio::time::{timeout, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, instrument};
+use tracing::{error, instrument};
 use uuid::Uuid;
 use yrs::block::ClientID;
 use yrs::sync::{Awareness, AwarenessUpdate};
@@ -52,16 +52,18 @@ pub(super) struct WorkspaceControllerActor {
   db: Db,
   notification_tx: tokio::sync::broadcast::Sender<WorkspaceNotification>,
   /// Used to record recently changed collabs
-  latest_changed_collabs: DashSet<ChangedCollab>,
+  changed_collab_sender: tokio::sync::broadcast::Sender<ChangedCollab>,
   #[cfg(debug_assertions)]
   pub skip_realtime_message: AtomicBool,
 }
 
 impl WorkspaceControllerActor {
   const PING_INTERVAL: Duration = Duration::from_secs(4);
+  const PING_TIMEOUT: Duration = Duration::from_secs(20);
   const REMOTE_ORIGIN: &'static str = "af";
 
   pub fn new(db: Db, options: Options, last_message_id: Rid) -> Arc<Self> {
+    let (changed_collab_sender, _) = tokio::sync::broadcast::channel(10);
     let (status_tx, status_rx) = tokio::sync::watch::channel(ConnectionStatus::default());
     let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
     let (notification_tx, _) = tokio::sync::broadcast::channel(100);
@@ -76,7 +78,7 @@ impl WorkspaceControllerActor {
       #[cfg(debug_assertions)]
       skip_realtime_message: AtomicBool::new(false),
       notification_tx,
-      latest_changed_collabs: DashSet::new(),
+      changed_collab_sender,
     });
     tokio::spawn(Self::actor_loop(
       Arc::downgrade(&actor),
@@ -85,18 +87,8 @@ impl WorkspaceControllerActor {
     actor
   }
 
-  /// Return current changed collab ids and clear the set.
-  pub fn consume_latest_changed_collabs(&self) -> HashSet<ChangedCollab> {
-    let result: HashSet<_> = self
-      .latest_changed_collabs
-      .iter()
-      .map(|item| ChangedCollab {
-        id: item.id,
-        collab_type: item.collab_type,
-      })
-      .collect();
-    self.latest_changed_collabs.clear();
-    result
+  pub fn subscribe_changed_collab(&self) -> tokio::sync::broadcast::Receiver<ChangedCollab> {
+    self.changed_collab_sender.subscribe()
   }
 
   pub fn subscribe_notification(&self) -> tokio::sync::broadcast::Receiver<WorkspaceNotification> {
@@ -258,7 +250,7 @@ impl WorkspaceControllerActor {
 
   #[instrument(level = "trace", skip_all)]
   pub(crate) fn set_connection_status(&self, status: ConnectionStatus) {
-    sync_trace!("set connection status: {:?}", status);
+    sync_info!("set connection status: {:?}", status);
     self.status_tx.send_replace(status);
   }
 
@@ -295,11 +287,22 @@ impl WorkspaceControllerActor {
             Some(actor) => actor,
             None => break, // controller dropped
           };
-          if let Err(err) = actor.ping().await {
-            sync_error!("failed to send ping: {}", err);
-            actor.set_connection_status(ConnectionStatus::Disconnected {
-              reason: Some(DisconnectedReason::Unexpected( err.to_string().into())),
-            });
+
+          let result = timeout(Self::PING_TIMEOUT, actor.ping()).await;
+          match result {
+            Ok(Ok(_)) => sync_trace!("sent ping successfully"),
+            Ok(Err(err)) => {
+              sync_error!("fail to send ping: {:?}", err);
+              actor.set_connection_status(ConnectionStatus::Disconnected {
+                reason: Some(DisconnectedReason::Unexpected("Ping send failed".into())),
+              });
+            },
+            Err(_) => {
+              sync_error!("ping timeout after {:?}", Self::PING_TIMEOUT);
+              actor.set_connection_status(ConnectionStatus::Disconnected {
+                reason: Some(DisconnectedReason::Unexpected("Ping timeout".into())),
+              });
+            }
           }
         }
       }
@@ -366,18 +369,10 @@ impl WorkspaceControllerActor {
       object_id,
       flags,
       update,
-      collab_type,
       ..
     } = &msg
     {
       let rid = source.into();
-      if !self.latest_changed_collabs.contains(object_id) {
-        self.latest_changed_collabs.insert(ChangedCollab {
-          id: *object_id,
-          collab_type: *collab_type,
-        });
-      }
-
       // persist
       match flags {
         UpdateFlags::Lib0v1 => self.db.save_update(object_id, rid, update, source),
@@ -401,7 +396,21 @@ impl WorkspaceControllerActor {
 
   async fn send_message(&self, msg: ClientMessage) -> anyhow::Result<()> {
     let sync_state = match &msg {
-      ClientMessage::Manifest { object_id, .. } => Some((*object_id, SyncState::InitSyncBegin)),
+      ClientMessage::Manifest {
+        object_id,
+        collab_type,
+        ..
+      } => {
+        if !matches!(collab_type, CollabType::DatabaseRow) {
+          sync_info!(
+            "[{}] sending {}/{} manifest to remote",
+            self.db.client_id(),
+            object_id,
+            collab_type
+          );
+        }
+        Some((*object_id, SyncState::InitSyncBegin))
+      },
       ClientMessage::Update { object_id, .. } => Some((*object_id, SyncState::SyncFinished)),
       ClientMessage::AwarenessUpdate { .. } => None,
     };
@@ -444,13 +453,26 @@ impl WorkspaceControllerActor {
     }
   }
 
-  #[instrument(level = "trace", skip_all)]
+  #[instrument(level = "debug", skip_all, err)]
   pub(crate) async fn handle_connect(
     actor: &Arc<Self>,
     access_token: String,
   ) -> Result<(), AppResponseError> {
     match &*actor.status_rx.borrow() {
-      ConnectionStatus::Connecting { .. } | ConnectionStatus::Connected { .. } => return Ok(()),
+      ConnectionStatus::Connecting { .. } => {
+        sync_info!(
+          "[{}] websocket already connecting, skipping connect",
+          actor.db.client_id()
+        );
+        return Ok(());
+      },
+      ConnectionStatus::Connected { .. } => {
+        sync_info!(
+          "[{}] websocket already connected, skipping connect",
+          actor.db.client_id()
+        );
+        return Ok(());
+      },
       ConnectionStatus::Disconnected { .. } => {},
       ConnectionStatus::StartReconnect => {},
     }
@@ -481,7 +503,7 @@ impl WorkspaceControllerActor {
         });
       },
       Some(connection) => {
-        sync_debug!("[{}] connected to {}", client_id, actor.options.url);
+        sync_info!("[{}] connected to {}", client_id, actor.options.url);
         let (sink, stream) = connection.split();
         let sink = Arc::new(Mutex::new(sink));
         actor.set_connection_status(ConnectionStatus::Connected {
@@ -594,7 +616,7 @@ impl WorkspaceControllerActor {
         },
       }
     }
-    sync_debug!("websocket receiver loop ended");
+    sync_info!("websocket receiver loop ended");
     Ok(())
   }
 
@@ -752,7 +774,7 @@ impl WorkspaceControllerActor {
 
         // Collabs not in memory are considered inactive. We need to sync these when
         // connection is established to handle changes made while offline.
-        sync_trace!(
+        sync_debug!(
           "[{}] pending collab {}/{} is inactive",
           self.client_id(),
           object_id,
@@ -837,7 +859,7 @@ impl WorkspaceControllerActor {
             sync_error!("Failed to get state vectors for batch: {}", err);
           },
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
       }
 
       cancel_token.cancel();
@@ -960,8 +982,8 @@ impl WorkspaceControllerActor {
     update_bytes: Vec<u8>,
     action_source: ActionSource,
   ) -> anyhow::Result<()> {
-    if !self.latest_changed_collabs.contains(&object_id) {
-      self.latest_changed_collabs.insert(ChangedCollab {
+    if matches!(action_source, ActionSource::Remote(_)) {
+      let _ = self.changed_collab_sender.send(ChangedCollab {
         id: object_id,
         collab_type,
       });
@@ -1033,7 +1055,7 @@ impl WorkspaceControllerActor {
     let awareness = collab.get_awareness();
     let doc = awareness.doc();
     let state_vector = doc.transact().state_vector();
-    tracing::debug!(
+    sync_debug!(
       "publishing manifest for {} (last msg id: {}): {:?}",
       object_id,
       last_message_id,
@@ -1105,7 +1127,7 @@ impl WorkspaceControllerActor {
       "{}/{}?clientId={}&deviceId={}",
       options.url, options.workspace_id, client_id, options.device_id
     );
-    info!("establishing WebSocket connection to: {}", url);
+    sync_info!("establishing WebSocket connection to: {}", url);
     // don't include auth token in the log message (or maybe it doesn't matter?)
     write!(url, "&token={}", access_token).unwrap();
     if options.sync_eagerly {
@@ -1121,17 +1143,17 @@ impl WorkspaceControllerActor {
       res = fut => {
         match res {
           Ok((stream, _resp)) => {
-            sync_info!("establishing WebSocket successfully");
+            sync_info!("establishing WebSocket successfully to {}", options.workspace_id);
             Ok(Some(stream))
           },
           Err(err) => {
-            sync_error!("establishing WebSocket failed");
+            sync_error!("establishing WebSocket failed to {}", options.workspace_id);
             Err(AppError::from(err).into())
           }
         }
       }
       _ = cancel.cancelled() => {
-        tracing::debug!("establishing connection cancelled");
+        sync_info!("establishing connection cancelled for {}", options.workspace_id);
         Ok(None)
       }
     }

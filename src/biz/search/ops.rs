@@ -1,14 +1,11 @@
 use crate::biz::collab::folder_view::PrivateSpaceAndTrashViews;
-use crate::biz::collab::utils::get_latest_collab_folder;
 use crate::{
   api::metrics::RequestMetrics, biz::collab::folder_view::private_space_and_trash_view_ids,
 };
 use app_error::AppError;
 use appflowy_ai_client::dto::EmbeddingModel;
-use appflowy_collaborate::collab::storage::CollabAccessControlStorage;
-use collab::core::collab::default_client_id;
+use appflowy_collaborate::ws2::WorkspaceCollabInstanceCache;
 use collab_folder::{Folder, View};
-use database::collab::GetCollabOrigin;
 use database::index::{search_documents, SearchDocumentParams};
 use indexer::scheduler::IndexerScheduler;
 use indexer::vector::embedder::{CreateEmbeddingRequestArgs, EmbeddingInput, EncodingFormat};
@@ -30,6 +27,7 @@ fn is_view_searchable(view: &View, workspace_id: &str) -> bool {
   view.id != workspace_id && view.parent_view_id != workspace_id && view.layout.is_document()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn populate_searchable_view_ids(
   folder: &Folder,
   private_space_and_trash_views: &PrivateSpaceAndTrashViews,
@@ -38,6 +36,7 @@ fn populate_searchable_view_ids(
   current_view_id: &Uuid,
   depth: i32,
   max_depth: i32,
+  uid: i64,
 ) {
   if depth > max_depth {
     return;
@@ -51,7 +50,7 @@ fn populate_searchable_view_ids(
   if is_other_private_space || is_trash {
     return;
   }
-  let view = match folder.get_view(&current_view_id.to_string()) {
+  let view = match folder.get_view(&current_view_id.to_string(), uid) {
     Some(view) => view,
     None => return,
   };
@@ -69,6 +68,7 @@ fn populate_searchable_view_ids(
       &child_id,
       depth + 1,
       max_depth,
+      uid,
     );
   }
 }
@@ -76,7 +76,7 @@ fn populate_searchable_view_ids(
 #[allow(clippy::too_many_arguments)]
 pub async fn search_document(
   pg_pool: &PgPool,
-  collab_storage: &CollabAccessControlStorage,
+  collab_instance_cache: &impl WorkspaceCollabInstanceCache,
   indexer_scheduler: &Arc<IndexerScheduler>,
   uid: i64,
   workspace_uuid: Uuid,
@@ -112,14 +112,8 @@ pub async fn search_document(
     .ok_or_else(|| AppError::Internal(anyhow::anyhow!("OpenAI returned no embeddings")))?;
 
   // Obtain the latest collab folder and gather searchable view IDs.
-  let folder = get_latest_collab_folder(
-    collab_storage,
-    GetCollabOrigin::User { uid },
-    workspace_uuid,
-    default_client_id(),
-  )
-  .await?;
-  let private_views = private_space_and_trash_view_ids(&folder)?;
+  let folder = collab_instance_cache.get_folder(workspace_uuid).await?;
+  let private_views = private_space_and_trash_view_ids(uid, &folder)?;
   let mut searchable_view_ids = HashSet::new();
   populate_searchable_view_ids(
     &folder,
@@ -129,6 +123,7 @@ pub async fn search_document(
     &workspace_uuid,
     0,
     MAX_SEARCH_DEPTH,
+    uid,
   );
 
   // Set default preview size and search parameters.

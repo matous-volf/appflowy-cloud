@@ -12,7 +12,6 @@ use collab_rt_protocol::CollabRef;
 use futures_core::Stream;
 use futures_util::stream::SplitSink;
 use shared_entity::response::AppResponseError;
-use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Weak};
 use tokio::sync::Mutex;
@@ -56,8 +55,8 @@ impl WorkspaceController {
     })
   }
 
-  pub fn consume_latest_changed_collab(&self) -> HashSet<ChangedCollab> {
-    self.actor.consume_latest_changed_collabs()
+  pub fn subscribe_changed_collab(&self) -> tokio::sync::broadcast::Receiver<ChangedCollab> {
+    self.actor.subscribe_changed_collab()
   }
 
   pub fn is_connected(&self) -> bool {
@@ -191,6 +190,7 @@ pub enum DisconnectedReason {
   UserDisconnect(Arc<str>),
   ServerForceClose,
   Unauthorized(Arc<str>),
+  PingTimeout,
 }
 
 impl Display for DisconnectedReason {
@@ -209,6 +209,7 @@ impl Display for DisconnectedReason {
       DisconnectedReason::UserDisconnect(reason) => write!(f, "user disconnect: {}", reason),
       DisconnectedReason::Unauthorized(reason) => write!(f, "unauthorized: {}", reason),
       DisconnectedReason::ServerForceClose => write!(f, "server force close"),
+      DisconnectedReason::PingTimeout => write!(f, "ping timeout"),
     }
   }
 }

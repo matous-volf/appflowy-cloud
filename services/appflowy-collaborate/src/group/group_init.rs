@@ -18,7 +18,9 @@ use collab_stream::client::CollabRedisStream;
 use collab_stream::collab_update_sink::CollabUpdateSink;
 
 use crate::metrics::CollabRealtimeMetrics;
+use appflowy_proto::Rid;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use collab_document::document::DocumentBody;
 use collab_stream::awareness_gossip::AwarenessUpdateSink;
 use collab_stream::error::StreamError;
@@ -26,8 +28,8 @@ use collab_stream::model::{
   AwarenessStreamUpdate, CollabStreamUpdate, MessageId, UpdateFlags, UpdateStreamMessage,
 };
 use dashmap::DashMap;
-use database::collab::{CollabStorage, GetCollabOrigin};
-use database_entity::dto::{CollabParams, QueryCollabParams};
+use database::collab::{CollabStore, GetCollabOrigin};
+use database_entity::dto::CollabParams;
 use futures::{pin_mut, Sink, Stream};
 use futures_util::{SinkExt, StreamExt};
 use indexer::scheduler::{IndexerScheduler, UnindexedCollabTask, UnindexedData};
@@ -36,12 +38,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, instrument, trace, warn};
 use uuid::Uuid;
 use yrs::sync::AwarenessUpdate;
 use yrs::updates::decoder::{Decode, DecoderV1};
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
-use yrs::{ReadTxn, StateVector, Update};
+use yrs::{DeleteSet, ReadTxn, StateVector, Update};
 
 /// A group used to manage a single [Collab] object
 pub struct CollabGroup {
@@ -77,21 +79,18 @@ impl Drop for CollabGroup {
 
 impl CollabGroup {
   #[allow(clippy::too_many_arguments)]
-  pub async fn new<S>(
+  pub async fn new(
     uid: i64,
     workspace_id: Uuid,
     object_id: Uuid,
     collab_type: CollabType,
     metrics: Arc<CollabRealtimeMetrics>,
-    storage: Arc<S>,
+    storage: Arc<dyn CollabStore>,
     collab_redis_stream: Arc<CollabRedisStream>,
     persistence_interval: Duration,
     state_vector: StateVector,
     indexer_scheduler: Arc<IndexerScheduler>,
-  ) -> Result<Self, StreamError>
-  where
-    S: CollabStorage,
-  {
+  ) -> Result<Self, StreamError> {
     let is_new_collab = state_vector.is_empty();
     let persister = CollabPersister::new(
       uid,
@@ -208,22 +207,33 @@ impl CollabGroup {
     Ok(())
   }
 
+  #[instrument(level = "trace", skip_all)]
   async fn handle_inbound_update(state: &CollabGroupState, update: CollabStreamUpdate) {
     let sender = update.sender.clone();
     match update.into_update() {
       Ok(update) => {
-        state
-          .state_vector
-          .write()
-          .await
-          .merge(update.state_vector());
+        let mut update_sv = StateVector::default();
+        let insertions = update.insertions(true);
+        let del_set = DeleteSet::from(insertions);
+        for (&client, blocks) in del_set.iter() {
+          if blocks.is_empty() {
+            continue;
+          }
+          let upper = blocks.iter().map(|b| b.end).max().unwrap();
+          update_sv.set_max(client, upper);
+        }
+
+        trace!(
+          "receive inbound {}/{} update {:#?}, state vector: {:#?}, server state vector: {:#?}",
+          state.object_id,
+          state.collab_type,
+          update,
+          update_sv,
+          state.state_vector.read().await,
+        );
+        state.state_vector.write().await.merge(update_sv);
 
         let seq_num = state.seq_no.fetch_add(1, Ordering::SeqCst) + 1;
-        tracing::trace!(
-          "broadcasting collab update from {} - seq_num: {}",
-          sender,
-          seq_num
-        );
         let payload = Message::Sync(SyncMessage::Update(update.encode_v1())).encode_v1();
         let message = BroadcastSync::new(sender, state.object_id.to_string(), payload, seq_num);
         for mut e in state.subscribers.iter_mut() {
@@ -270,7 +280,7 @@ impl CollabGroup {
         res = updates.recv() => {
           match res {
             Some(awareness_update) => {
-              Self::handle_inbound_awareness(&state, awareness_update).await;
+              Self::handle_inbound_awareness(&state, &awareness_update).await;
             },
             None => {
               break;
@@ -282,13 +292,9 @@ impl CollabGroup {
     Ok(())
   }
 
-  async fn handle_inbound_awareness(state: &CollabGroupState, update: AwarenessStreamUpdate) {
-    tracing::trace!(
-      "broadcasting awareness update from {} (contains {} clients)",
-      update.sender,
-      update.data.clients.len()
-    );
-    let sender = update.sender;
+  async fn handle_inbound_awareness(state: &CollabGroupState, update: &AwarenessStreamUpdate) {
+    tracing::trace!("broadcast awareness {:#?}", update.data,);
+    let sender = &update.sender;
     let message = AwarenessSync::new(
       state.object_id.to_string(),
       Message::Awareness(update.data.encode_v1()).encode_v1(),
@@ -296,7 +302,7 @@ impl CollabGroup {
     );
     for mut e in state.subscribers.iter_mut() {
       let subscription = e.value_mut();
-      if sender == subscription.collab_origin {
+      if sender == &subscription.collab_origin {
         continue; // don't send update to its sender
       }
 
@@ -346,6 +352,26 @@ impl CollabGroup {
     }
   }
 
+  pub async fn calculate_missing_update(
+    &self,
+    state_vector: StateVector,
+  ) -> Result<Vec<u8>, RealtimeError> {
+    {
+      // first check if we need to send any updates
+      let collab_sv = self.state.state_vector.read().await;
+      if *collab_sv <= state_vector {
+        return Ok(vec![]);
+      }
+    }
+
+    let encoded_collab = self.encode_collab().await?;
+    let options = CollabOptions::new(self.object_id().to_string(), default_client_id())
+      .with_data_source(DataSource::DocStateV1(encoded_collab.doc_state.into()));
+    let collab = Collab::new_with_options(CollabOrigin::Server, options)?;
+    let update = collab.transact().encode_state_as_update_v1(&state_vector);
+    Ok(update)
+  }
+
   /// Generate embedding for the current Collab immediately
   ///
   pub async fn generate_embeddings(&self) -> Result<(), AppError> {
@@ -366,26 +392,6 @@ impl CollabGroup {
       .indexer_scheduler
       .index_collab_immediately(workspace_id, object_id, &collab, collab_type)
       .await
-  }
-
-  pub async fn calculate_missing_update(
-    &self,
-    state_vector: StateVector,
-  ) -> Result<Vec<u8>, RealtimeError> {
-    {
-      // first check if we need to send any updates
-      let collab_sv = self.state.state_vector.read().await;
-      if *collab_sv <= state_vector {
-        return Ok(vec![]);
-      }
-    }
-
-    let encoded_collab = self.encode_collab().await?;
-    let options = CollabOptions::new(self.object_id().to_string(), default_client_id())
-      .with_data_source(DataSource::DocStateV1(encoded_collab.doc_state.into()));
-    let collab = Collab::new_with_options(CollabOrigin::Server, options)?;
-    let update = collab.transact().encode_state_as_update_v1(&state_vector);
-    Ok(update)
   }
 
   pub async fn encode_collab(&self) -> Result<EncodedCollab, RealtimeError> {
@@ -522,15 +528,12 @@ impl CollabGroup {
       }
       for message in messages {
         match Self::handle_client_message(state, message).await {
-          Ok(response) => {
-            trace!("[realtime]: sending response: {}", response);
-            match sink.send(response.into()).await {
-              Ok(()) => {},
-              Err(err) => {
-                trace!("[realtime]: send failed: {}", err);
-                break;
-              },
-            }
+          Ok(response) => match sink.send(response.into()).await {
+            Ok(()) => {},
+            Err(err) => {
+              trace!("[realtime]: send failed: {}", err);
+              break;
+            },
           },
           Err(err) => {
             error!(
@@ -566,12 +569,6 @@ impl CollabGroup {
         state.seq_no.load(Ordering::SeqCst),
       ));
     }
-
-    trace!(
-      "Applying client updates: {}, origin:{}",
-      collab_msg,
-      message_origin
-    );
 
     let payload = collab_msg.payload();
 
@@ -675,19 +672,45 @@ impl CollabGroup {
 
   async fn handle_sync_step1(
     state: &CollabGroupState,
-    remote_sv: &StateVector,
+    client_sv: &StateVector,
   ) -> Result<Option<Vec<u8>>, RTProtocolError> {
     if let Ok(sv) = state.state_vector.try_read() {
+      trace!(
+        "Sync step1: {}/{} server state vector: {:#?}, client state vector: {:#?}",
+        state.object_id,
+        state.collab_type,
+        sv,
+        client_sv
+      );
       // we optimistically try to obtain state vector lock for a fast track:
       // if we remote sv is up-to-date with current one, we don't need to do anything
-      match sv.partial_cmp(remote_sv) {
-        Some(std::cmp::Ordering::Equal) => return Ok(None), // client and server are in sync
+      match sv.partial_cmp(client_sv) {
+        Some(std::cmp::Ordering::Equal) => {
+          trace!(
+            "Sync step1: {}/{} client and server are synced, no need to send anything",
+            state.object_id,
+            state.collab_type
+          );
+          return Ok(None);
+        }, // client and server are in sync
         Some(std::cmp::Ordering::Less) => {
           // server is behind client
+          trace!(
+            "Sync step1: server {}/{} is behind client, sending sync step 1 with state vector: {:#?}",
+            state.object_id, state.collab_type,
+            sv
+          );
           let msg = Message::Sync(SyncMessage::SyncStep1(sv.clone()));
           return Ok(Some(msg.encode_v1()));
         },
-        Some(std::cmp::Ordering::Greater) | None => { /* server has some new updates */ },
+        Some(std::cmp::Ordering::Greater) | None => {
+          // server has some new updates
+          trace!(
+            "Sync step1: server has some new updates for {}/{}",
+            state.object_id,
+            state.collab_type
+          );
+        },
       }
     }
 
@@ -701,7 +724,7 @@ impl CollabGroup {
 
     // prepare document state update and state vector
     let tx = snapshot.collab.transact();
-    let doc_state = tx.encode_diff_v1(remote_sv);
+    let doc_state = tx.encode_diff_v1(client_sv);
     let local_sv = tx.state_vector();
     drop(tx);
 
@@ -735,37 +758,82 @@ impl CollabGroup {
       .await
       .map_err(|err| RTProtocolError::Internal(err.into()))??
     };
+
     state
       .metrics
       .load_collab_time
       .observe(start.elapsed().as_millis() as f64);
-    let missing_updates = {
+
+    let (should_apply_update, missing_updates) = {
       let current_sv = state.state_vector.read().await;
-      let update_sv = decoded_update.state_vector();
+      let update_sv = decoded_update.state_vector_lower();
+      trace!(
+        "Sync step2: {}/{} new update: {:#?}, state vector: {:#?}, server state vector: {:#?}",
+        state.object_id,
+        state.collab_type,
+        decoded_update,
+        update_sv,
+        current_sv,
+      );
       match current_sv.partial_cmp(&update_sv) {
         None => {
-          // None marks concurrent state vectors, meaning that current collab group
-          // has some of the updates that the client didn't see and vice versa
-          tracing::trace!("missing updates found for {}", state.object_id);
-          Some(Message::Sync(SyncMessage::SyncStep1(current_sv.clone())).encode_v1())
+          // Concurrent state vectors: both server and client have updates the other hasn't seen
+          // We should apply the update to merge the states, then inform the client of our state
+          trace!(
+            "Sync step2: {}/{} concurrent state vectors, current: {:#?}, update: {:#?}",
+            state.object_id,
+            state.collab_type,
+            current_sv,
+            update_sv
+          );
+          (
+            true,
+            Some(Message::Sync(SyncMessage::SyncStep1(current_sv.clone())).encode_v1()),
+          )
         },
-        Some(std::cmp::Ordering::Greater) if decoded_update.delete_set().is_empty() => {
-          // This update has no new data. In fact server is more up to date, that this
-          // update suggests, so we'll discard it and send sync step back to the client
-          // to let it know that we have new data, that client needs to know about.
-          return Ok(Some(
-            Message::Sync(SyncMessage::SyncStep1(current_sv.clone())).encode_v1(),
-          ));
+        Some(std::cmp::Ordering::Less) => {
+          if !decoded_update.extends(&current_sv) {
+            // server is behind client, but the update doesn't extend current server state
+            // which means that we must have missed some updates, that must be integrated
+            // before current update can be fully applied
+            trace!(
+              "Sync step2: server {}/{} is behind client",
+              state.object_id,
+              state.collab_type,
+            );
+            return Ok(Some(
+              Message::Sync(SyncMessage::SyncStep1(current_sv.clone())).encode_v1(),
+            ));
+          } else {
+            (true, None)
+          }
         },
-        _ => None,
+        Some(std::cmp::Ordering::Equal) => {
+          trace!(
+            "Sync step2: {}/{} server and client are synced",
+            state.object_id,
+            state.collab_type,
+          );
+          (true, None)
+        },
+        Some(std::cmp::Ordering::Greater) => {
+          trace!(
+            "Sync step2: {}/{} server is ahead of client",
+            state.object_id,
+            state.collab_type,
+          );
+          (true, None)
+        },
       }
     };
 
-    state
-      .persister
-      .send_update(origin.clone(), update)
-      .await
-      .map_err(|err| RTProtocolError::Internal(err.into()))?;
+    if should_apply_update {
+      state
+        .persister
+        .send_update(origin.clone(), update)
+        .await
+        .map_err(|err| RTProtocolError::Internal(err.into()))?;
+    }
 
     Ok(missing_updates)
   }
@@ -784,6 +852,7 @@ impl CollabGroup {
     update: Vec<u8>,
   ) -> Result<Option<Vec<u8>>, RTProtocolError> {
     let awareness_update = AwarenessUpdate::decode_v1(&update)?;
+    trace!("awareness updates: {:#?}", awareness_update);
     state
       .persister
       .send_awareness(origin, awareness_update)
@@ -814,7 +883,7 @@ impl CollabGroup {
     // the client will automatically send an initialization sync to reinitialize the group.
     const MAXIMUM_SECS: u64 = 3 * 60 * 60;
     if elapsed_secs > MAXIMUM_SECS {
-      info!(
+      debug!(
         "Group:{}:{} is inactive for {} seconds, subscribers: {}",
         self.state.object_id,
         self.state.collab_type,
@@ -871,7 +940,7 @@ struct CollabPersister {
   workspace_id: Uuid,
   object_id: Uuid,
   collab_type: CollabType,
-  storage: Arc<dyn CollabStorage>,
+  storage: Arc<dyn CollabStore>,
   collab_redis_stream: Arc<CollabRedisStream>,
   indexer_scheduler: Arc<IndexerScheduler>,
   metrics: Arc<CollabRealtimeMetrics>,
@@ -886,7 +955,7 @@ impl CollabPersister {
     workspace_id: Uuid,
     object_id: Uuid,
     collab_type: CollabType,
-    storage: Arc<dyn CollabStorage>,
+    storage: Arc<dyn CollabStore>,
     collab_redis_stream: Arc<CollabRedisStream>,
     indexer_scheduler: Arc<IndexerScheduler>,
     metrics: Arc<CollabRealtimeMetrics>,
@@ -910,6 +979,7 @@ impl CollabPersister {
     })
   }
 
+  #[instrument(level = "trace", skip_all)]
   async fn send_update(
     &self,
     sender: CollabOrigin,
@@ -940,7 +1010,7 @@ impl CollabPersister {
       sender: sender_session.clone(),
     };
     self.awareness_sink.send(&update).await?;
-    tracing::trace!("broadcasted awareness from {}", update.sender);
+    trace!("broadcast awareness {:#?}", update);
     Ok(())
   }
 
@@ -949,25 +1019,23 @@ impl CollabPersister {
     tracing::trace!("requested to load compact collab {}", self.object_id);
     // 1. Try to load the latest snapshot from storage
     let start = Instant::now();
-    let mut collab = match self.load_collab_full().await? {
-      Some(collab) => collab,
+    let (rid, mut collab) = match self.load_collab_full().await? {
+      Some((rid, collab)) => (rid, collab),
       None => {
         let options = CollabOptions::new(self.object_id.to_string(), default_client_id());
-        Collab::new_with_options(CollabOrigin::Server, options)?
+        let collab = Collab::new_with_options(CollabOrigin::Server, options)?;
+        (Rid::default(), collab)
       },
     };
     self.metrics.load_collab_count.inc();
+    let since = MessageId::new(rid.timestamp, rid.seq_no);
 
     // 2. consume all Redis updates on top of it (keep redis msg id)
     let mut applied_messages = Vec::new();
     let mut tx = collab.transact_mut();
     let updates = self
       .collab_redis_stream
-      .current_collab_updates(
-        &self.workspace_id,
-        &self.object_id,
-        None, //TODO: store Redis last msg id somewhere in doc state snapshot and replay from there
-      )
+      .current_collab_updates(&self.workspace_id, &self.object_id, Some(since))
       .await?;
     let mut i = 0;
     for (message_id, update) in updates {
@@ -979,6 +1047,7 @@ impl CollabPersister {
       applied_messages.push(message_id); //TODO: shouldn't this happen before decoding?
       self.metrics.apply_update_count.inc();
     }
+
     drop(tx);
     tracing::trace!(
       "loaded collab compact state: {} replaying {} updates",
@@ -993,6 +1062,7 @@ impl CollabPersister {
     // now we have the most recent version of the document
     let snapshot = CollabSnapshot {
       collab,
+      rid,
       applied_messages,
     };
     Ok(snapshot)
@@ -1012,11 +1082,12 @@ impl CollabPersister {
       return Ok(None);
     }
 
-    let mut collab = match self.load_collab_full().await? {
+    let (rid, mut collab) = match self.load_collab_full().await? {
       Some(collab) => collab,
       None => {
         let options = CollabOptions::new(self.object_id.to_string(), default_client_id());
-        Collab::new_with_options(CollabOrigin::Server, options)?
+        let collab = Collab::new_with_options(CollabOrigin::Server, options)?;
+        (Rid::default(), collab)
       },
     };
     let start = Instant::now();
@@ -1057,6 +1128,7 @@ impl CollabPersister {
     }
     Ok(Some(CollabSnapshot {
       collab,
+      rid,
       applied_messages,
     }))
   }
@@ -1094,9 +1166,13 @@ impl CollabPersister {
     {
       let collab = snapshot.collab;
       // encode_diff doesn't include pending updates
-      let doc_state_light = collab.transact().encode_diff_v1(&StateVector::default());
+      let tx = collab.transact();
+      let doc_state_light = tx.encode_diff_v1(&StateVector::default());
+      let state_vector = tx.state_vector();
       let light_len = doc_state_light.len();
-      self.write_collab(doc_state_light).await?;
+      self
+        .write_collab(doc_state_light, state_vector, snapshot.rid.timestamp)
+        .await?;
 
       match self.collab_type {
         CollabType::Document => {
@@ -1131,8 +1207,14 @@ impl CollabPersister {
     Ok(())
   }
 
-  async fn write_collab(&self, doc_state_v1: Vec<u8>) -> Result<(), RealtimeError> {
-    let encoded_collab = EncodedCollab::new_v1(Default::default(), doc_state_v1)
+  async fn write_collab(
+    &self,
+    doc_state_v1: Vec<u8>,
+    state_vector: StateVector,
+    mills_secs: u64,
+  ) -> Result<(), RealtimeError> {
+    let updated_at = DateTime::<Utc>::from_timestamp_millis(mills_secs as i64);
+    let encoded_collab = EncodedCollab::new_v1(state_vector.encode_v1(), doc_state_v1)
       .encode_to_bytes()
       .map(Bytes::from)
       .map_err(|err| RealtimeError::BincodeEncode(err.to_string()))?;
@@ -1144,11 +1226,11 @@ impl CollabPersister {
       object_id: self.object_id,
       encoded_collab_v1: encoded_collab,
       collab_type: self.collab_type,
-      updated_at: None,
+      updated_at,
     };
     self
       .storage
-      .queue_insert_or_update_collab(self.workspace_id, &self.uid, params, true)
+      .upsert_collab(self.workspace_id, &self.uid, params)
       .await
       .map_err(|err| RealtimeError::Internal(err.into()))?;
     Ok(())
@@ -1172,15 +1254,20 @@ impl CollabPersister {
     }
   }
 
-  async fn load_collab_full(&self) -> Result<Option<Collab>, RealtimeError> {
+  #[instrument(level = "trace", skip_all)]
+  async fn load_collab_full(&self) -> Result<Option<(Rid, Collab)>, RealtimeError> {
     // we didn't find a snapshot, or we want a lightweight collab version
-    let params = QueryCollabParams::new(self.object_id, self.collab_type, self.workspace_id);
     let result = self
       .storage
-      .get_encode_collab(GetCollabOrigin::Server, params, false)
+      .get_full_encode_collab(
+        GetCollabOrigin::Server,
+        &self.workspace_id,
+        &self.object_id,
+        self.collab_type,
+      )
       .await;
-    let doc_state = match result {
-      Ok(encoded_collab) => encoded_collab.doc_state,
+    let (rid, doc_state) = match result {
+      Ok(value) => (value.rid, value.encoded_collab.doc_state),
       Err(AppError::RecordNotFound(_)) => return Ok(None),
       Err(err) => return Err(RealtimeError::Internal(err.into())),
     };
@@ -1190,11 +1277,12 @@ impl CollabPersister {
         .with_data_source(DataSource::DocStateV1(doc_state.into()));
       Collab::new_with_options(CollabOrigin::Server, options)?
     };
-    Ok(Some(collab))
+    Ok(Some((rid, collab)))
   }
 }
 
 pub struct CollabSnapshot {
   pub collab: Collab,
+  pub rid: Rid,
   pub applied_messages: Vec<MessageId>,
 }

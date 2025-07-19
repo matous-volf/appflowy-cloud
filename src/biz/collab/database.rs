@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
-use super::utils::{batch_get_latest_collab_encoded, get_latest_collab_encoded};
+use super::utils::batch_get_latest_collab_encoded;
 use app_error::AppError;
-use appflowy_collaborate::collab::storage::CollabAccessControlStorage;
 use async_trait::async_trait;
-use collab_database::workspace_database::DatabaseCollabReader;
+use collab::lock::RwLock;
+use collab_database::database_trait::{DatabaseCollabReader, EncodeCollabByOid};
+use collab_database::rows::{DatabaseRow, RowId};
 use collab_database::{
   database::{gen_database_group_id, gen_field_id},
   entity::FieldType,
@@ -17,10 +18,10 @@ use collab_database::{
     BoardLayoutSetting, CalendarLayoutSetting, DatabaseLayout, FieldSettingsByFieldIdMap, Group,
     GroupSetting, GroupSettingMap, LayoutSettings,
   },
-  workspace_database::EncodeCollabByOid,
 };
 use collab_entity::{CollabType, EncodedCollab};
-use database::collab::GetCollabOrigin;
+use dashmap::DashMap;
+use database::collab::{CollabStore, GetCollabOrigin};
 use uuid::Uuid;
 use yrs::block::ClientID;
 
@@ -169,41 +170,54 @@ fn create_card_status_field() -> Field {
 #[derive(Clone)]
 pub struct PostgresDatabaseCollabService {
   pub workspace_id: Uuid,
-  pub collab_storage: Arc<CollabAccessControlStorage>,
+  pub collab_storage: Arc<dyn CollabStore>,
   pub client_id: ClientID,
+  cache: Arc<DashMap<RowId, Arc<RwLock<DatabaseRow>>>>,
 }
 
 impl PostgresDatabaseCollabService {
-  pub async fn get_latest_collab(&self, oid: Uuid, collab_type: CollabType) -> EncodedCollab {
-    get_latest_collab_encoded(
-      &self.collab_storage,
-      GetCollabOrigin::Server,
-      self.workspace_id,
-      oid,
-      collab_type,
-    )
-    .await
-    .unwrap()
+  pub fn new(
+    workspace_id: Uuid,
+    collab_storage: Arc<dyn CollabStore>,
+    client_id: ClientID,
+  ) -> Self {
+    Self {
+      workspace_id,
+      collab_storage,
+      client_id,
+      cache: Arc::new(DashMap::new()),
+    }
   }
 }
 
 #[async_trait]
 impl DatabaseCollabReader for PostgresDatabaseCollabService {
-  async fn client_id(&self) -> ClientID {
+  async fn reader_client_id(&self) -> ClientID {
     self.client_id
   }
 
-  async fn get_collab(
+  async fn reader_get_collab(
     &self,
     object_id: &str,
     collab_type: CollabType,
   ) -> Result<EncodedCollab, DatabaseError> {
     let object_id = Uuid::parse_str(object_id)?;
-    let collab_data = self.get_latest_collab(object_id, collab_type).await;
+    let collab_data = self
+      .collab_storage
+      .get_full_encode_collab(
+        GetCollabOrigin::Server,
+        &self.workspace_id,
+        &object_id,
+        collab_type,
+      )
+      .await
+      .map(|v| v.encoded_collab)
+      .map_err(|err| DatabaseError::Internal(err.into()))?;
+
     Ok(collab_data)
   }
 
-  async fn batch_get_collabs(
+  async fn reader_batch_get_collabs(
     &self,
     object_ids: Vec<String>,
     collab_type: CollabType,
@@ -225,6 +239,10 @@ impl DatabaseCollabReader for PostgresDatabaseCollabService {
     .map(|(k, v)| (k.to_string(), v))
     .collect();
     Ok(encoded_collabs)
+  }
+
+  fn database_row_cache(&self) -> Option<Arc<DashMap<RowId, Arc<RwLock<DatabaseRow>>>>> {
+    Some(self.cache.clone())
   }
 }
 

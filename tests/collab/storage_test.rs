@@ -6,7 +6,6 @@ use collab::core::transaction::DocTransactionExtension;
 use collab::entity::EncodedCollab;
 use collab::preclude::{Doc, Transact};
 use collab_entity::CollabType;
-use database::collab::CollabMetadata;
 use database_entity::dto::{
   CreateCollabParams, DeleteCollabParams, QueryCollab, QueryCollabParams, QueryCollabResult,
 };
@@ -129,7 +128,10 @@ async fn success_part_batch_get_collab_test() {
       expected_results.insert(
         object_id,
         QueryCollabResult::Failed {
-          error: "Record not found".to_string(),
+          error: format!(
+            "Record not found:Collab not found for object_id: {}",
+            object_id
+          ),
         },
       );
     } else {
@@ -338,12 +340,12 @@ async fn collab_mem_cache_read_write_test() {
   let encode_collab = EncodedCollab::new_v1(vec![1, 2, 3], vec![4, 5, 6]);
 
   let object_id = Uuid::new_v4();
-  let timestamp = chrono::Utc::now().timestamp();
+  let timestamp = chrono::Utc::now().timestamp_millis() as u64;
   mem_cache
     .insert_encode_collab_data(
       &object_id,
       &encode_collab.encode_to_bytes().unwrap(),
-      timestamp,
+      timestamp.into(),
       None,
     )
     .await
@@ -360,12 +362,12 @@ async fn collab_mem_cache_insert_override_test() {
   let mem_cache = CollabMemCache::new(pool(), conn, CollabMetrics::default().into());
   let object_id = Uuid::new_v4();
   let encode_collab = EncodedCollab::new_v1(vec![1, 2, 3], vec![4, 5, 6]);
-  let mut timestamp = chrono::Utc::now().timestamp();
+  let mut timestamp = chrono::Utc::now().timestamp_millis() as u64;
   mem_cache
     .insert_encode_collab_data(
       &object_id,
       &encode_collab.encode_to_bytes().unwrap(),
-      timestamp,
+      timestamp.into(),
       None,
     )
     .await
@@ -380,7 +382,7 @@ async fn collab_mem_cache_insert_override_test() {
       &EncodedCollab::new_v1(vec![6, 7, 8], vec![9, 10, 11])
         .encode_to_bytes()
         .unwrap(),
-      timestamp,
+      timestamp.into(),
       None,
     )
     .await
@@ -400,7 +402,7 @@ async fn collab_mem_cache_insert_override_test() {
       &EncodedCollab::new_v1(vec![12, 13, 14], vec![15, 16, 17])
         .encode_to_bytes()
         .unwrap(),
-      timestamp,
+      timestamp.into(),
       None,
     )
     .await
@@ -410,27 +412,6 @@ async fn collab_mem_cache_insert_override_test() {
   let (_, encode_collab_from_cache) = mem_cache.get_encode_collab(&object_id).await.unwrap();
   assert_eq!(encode_collab_from_cache.doc_state, vec![15, 16, 17]);
   assert_eq!(encode_collab_from_cache.state_vector, vec![12, 13, 14]);
-}
-
-#[tokio::test]
-async fn collab_meta_redis_cache_test() {
-  let conn = redis_connection_manager().await;
-  let mem_cache = CollabMemCache::new(pool(), conn, CollabMetrics::default().into());
-  mem_cache
-    .get_collab_meta(&Uuid::new_v4())
-    .await
-    .unwrap_err();
-
-  let object_id = Uuid::new_v4();
-  let workspace_id = Uuid::new_v4();
-  let meta = CollabMetadata {
-    object_id,
-    workspace_id,
-  };
-  mem_cache.insert_collab_meta(meta.clone()).await.unwrap();
-  let meta_from_cache = mem_cache.get_collab_meta(&object_id).await.unwrap();
-  assert_eq!(meta.workspace_id, meta_from_cache.workspace_id);
-  assert_eq!(meta.object_id, meta_from_cache.object_id);
 }
 
 #[tokio::test]

@@ -2054,11 +2054,11 @@ dependencies = [
  "dashmap 5.5.3",
  "database-entity",
  "dotenvy",
- "futures",
  "gotrue",
  "hex",
  "lazy_static",
  "mime",
+ "rand 0.9.1",
  "reqwest",
  "serde",
  "serde_json",
@@ -2100,7 +2100,7 @@ dependencies = [
 [[package]]
 name = "collab"
 version = "0.2.0"
-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Collab?rev=b03aed27f6c4cd563a5863c928b8e5cd66d572a7#b03aed27f6c4cd563a5863c928b8e5cd66d572a7"
+source = "git+https://github.com/AppFlowy-IO/AppFlowy-Collab?rev=e59260e524f33104b0ddcd6bb8f6218cad0f7e18#e59260e524f33104b0ddcd6bb8f6218cad0f7e18"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2126,7 +2126,7 @@ dependencies = [
 [[package]]
 name = "collab-database"
 version = "0.2.0"
-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Collab?rev=b03aed27f6c4cd563a5863c928b8e5cd66d572a7#b03aed27f6c4cd563a5863c928b8e5cd66d572a7"
+source = "git+https://github.com/AppFlowy-IO/AppFlowy-Collab?rev=e59260e524f33104b0ddcd6bb8f6218cad0f7e18#e59260e524f33104b0ddcd6bb8f6218cad0f7e18"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2166,7 +2166,7 @@ dependencies = [
 [[package]]
 name = "collab-document"
 version = "0.2.0"
-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Collab?rev=b03aed27f6c4cd563a5863c928b8e5cd66d572a7#b03aed27f6c4cd563a5863c928b8e5cd66d572a7"
+source = "git+https://github.com/AppFlowy-IO/AppFlowy-Collab?rev=e59260e524f33104b0ddcd6bb8f6218cad0f7e18#e59260e524f33104b0ddcd6bb8f6218cad0f7e18"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2187,7 +2187,7 @@ dependencies = [
 [[package]]
 name = "collab-entity"
 version = "0.2.0"
-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Collab?rev=b03aed27f6c4cd563a5863c928b8e5cd66d572a7#b03aed27f6c4cd563a5863c928b8e5cd66d572a7"
+source = "git+https://github.com/AppFlowy-IO/AppFlowy-Collab?rev=e59260e524f33104b0ddcd6bb8f6218cad0f7e18#e59260e524f33104b0ddcd6bb8f6218cad0f7e18"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2207,7 +2207,7 @@ dependencies = [
 [[package]]
 name = "collab-folder"
 version = "0.2.0"
-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Collab?rev=b03aed27f6c4cd563a5863c928b8e5cd66d572a7#b03aed27f6c4cd563a5863c928b8e5cd66d572a7"
+source = "git+https://github.com/AppFlowy-IO/AppFlowy-Collab?rev=e59260e524f33104b0ddcd6bb8f6218cad0f7e18#e59260e524f33104b0ddcd6bb8f6218cad0f7e18"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2229,7 +2229,7 @@ dependencies = [
 [[package]]
 name = "collab-importer"
 version = "0.1.0"
-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Collab?rev=b03aed27f6c4cd563a5863c928b8e5cd66d572a7#b03aed27f6c4cd563a5863c928b8e5cd66d572a7"
+source = "git+https://github.com/AppFlowy-IO/AppFlowy-Collab?rev=e59260e524f33104b0ddcd6bb8f6218cad0f7e18#e59260e524f33104b0ddcd6bb8f6218cad0f7e18"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -2268,7 +2268,7 @@ dependencies = [
 [[package]]
 name = "collab-plugins"
 version = "0.2.0"
-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Collab?rev=b03aed27f6c4cd563a5863c928b8e5cd66d572a7#b03aed27f6c4cd563a5863c928b8e5cd66d572a7"
+source = "git+https://github.com/AppFlowy-IO/AppFlowy-Collab?rev=e59260e524f33104b0ddcd6bb8f6218cad0f7e18#e59260e524f33104b0ddcd6bb8f6218cad0f7e18"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2375,7 +2375,7 @@ dependencies = [
 [[package]]
 name = "collab-user"
 version = "0.2.0"
-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Collab?rev=b03aed27f6c4cd563a5863c928b8e5cd66d572a7#b03aed27f6c4cd563a5863c928b8e5cd66d572a7"
+source = "git+https://github.com/AppFlowy-IO/AppFlowy-Collab?rev=e59260e524f33104b0ddcd6bb8f6218cad0f7e18#e59260e524f33104b0ddcd6bb8f6218cad0f7e18"
 dependencies = [
  "anyhow",
  "collab",
@@ -2826,6 +2826,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "app-error",
+ "appflowy-proto",
  "async-trait",
  "aws-sdk-s3",
  "chrono",
@@ -9051,9 +9052,9 @@ dependencies = [
 
 [[package]]
 name = "yrs"
-version = "0.23.4"
+version = "0.23.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb1d740a98b12112352f05ddfc06c1505b66fca116601f9388b84be45d21f84d"
+checksum = "197c2b4b298f35c3ba4d549884ac872a961112095b29f173ab45e3d5cf609018"
 dependencies = [
  "arc-swap",
  "async-lock",

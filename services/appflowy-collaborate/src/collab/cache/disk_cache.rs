@@ -1,4 +1,4 @@
-use crate::collab::cache::encode_collab_from_bytes;
+use crate::collab::cache::encode_collab_from_bytes_with_thread_pool;
 use crate::CollabMetrics;
 use anyhow::{anyhow, Context};
 use app_error::AppError;
@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
-use tracing::{error, instrument, trace};
+use tracing::{debug, error, instrument, trace};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -255,18 +255,18 @@ impl CollabDiskCache {
   }
 
   #[instrument(level = "trace", skip_all)]
-  pub async fn get_collab_encoded_from_disk(
+  pub async fn get_encoded_collab_from_disk(
     &self,
     workspace_id: &Uuid,
     query: QueryCollab,
   ) -> Result<(Rid, EncodedCollab), AppError> {
-    tracing::debug!("try get {}:{} from s3", query.collab_type, query.object_id);
+    debug!("try get {}:{} from s3", query.collab_type, query.object_id);
     let key = collab_key(workspace_id, &query.object_id);
 
     let is_deleted = self.is_collab_deleted(&query.object_id).await?;
     if is_deleted {
       return Err(AppError::RecordDeleted(format!(
-        "Collaboration record for {}:{} is deleted",
+        "{}/{} is deleted from db",
         query.collab_type, query.object_id
       )));
     }
@@ -277,10 +277,9 @@ impl CollabDiskCache {
         return Ok((rid, encoded_collab));
       },
       Err(AppError::RecordNotFound(_)) => {
-        tracing::debug!(
-          "try get {}:{} from database",
-          query.collab_type,
-          query.object_id
+        debug!(
+          "Can not find the {}/{} from s3, trying to get from Postgres",
+          query.collab_type, query.object_id
         );
       },
       Err(e) => return Err(e),
@@ -297,12 +296,17 @@ impl CollabDiskCache {
         Ok((updated_at, data)) => {
           self.metrics.pg_read_collab_count.inc();
           let rid = Rid::new(updated_at.timestamp_millis() as u64, 0);
-          let encoded_collab = encode_collab_from_bytes(&self.thread_pool, data).await?;
+          let encoded_collab =
+            encode_collab_from_bytes_with_thread_pool(&self.thread_pool, data).await?;
           return Ok((rid, encoded_collab));
         },
         Err(e) => {
           match e {
             Error::RowNotFound => {
+              debug!(
+                "Can not find the {}/{} from Postgres",
+                query.object_id, query.collab_type
+              );
               let msg = format!("Can't find the row for query: {:?}", query);
               return Err(AppError::RecordNotFound(msg));
             },
