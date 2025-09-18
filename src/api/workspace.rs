@@ -3,6 +3,7 @@ use crate::api::util::{compress_type_from_header_value, device_id_from_headers};
 use crate::api::ws::RealtimeServerAddr;
 use crate::biz;
 use crate::biz::authentication::jwt::{Authorization, OptionalUserUuid, UserUuid};
+use crate::biz::collab::database::check_if_row_document_collab_exists;
 use crate::biz::collab::ops::{
   get_user_favorite_folder_views, get_user_recent_folder_views, get_user_trash_folder_views,
 };
@@ -16,7 +17,7 @@ use crate::biz::workspace::invite::{
 use crate::biz::workspace::ops::{
   create_comment_on_published_view, create_reaction_on_comment, get_comments_on_published_view,
   get_reactions_on_published_view, get_workspace_owner, remove_comment_on_published_view,
-  remove_reaction_on_comment,
+  remove_reaction_on_comment, update_workspace_member_profile,
 };
 use crate::biz::workspace::page_view::{
   add_recent_pages, append_block_at_the_end_of_page, create_database_view, create_folder_view,
@@ -137,6 +138,18 @@ pub fn workspace_scope() -> Scope {
         .route(web::put().to(update_workspace_member_handler))
         .route(web::delete().to(remove_workspace_member_handler)),
     )
+    .service(
+      web::resource("/{workspace_id}/mentionable-person")
+        .route(web::get().to(list_workspace_mentionable_person_handler)),
+    )
+    .service(
+      web::resource("/{workspace_id}/mentionable-person/{contact_id}")
+        .route(web::get().to(get_workspace_mentionable_person_handler)),
+    )
+    .service(
+      web::resource("/{workspace_id}/update-member-profile")
+        .route(web::put().to(put_workspace_member_profile_handler)),
+    )
     // Deprecated since v0.9.24
     .service(
       web::resource("/{workspace_id}/member/user/{user_id}")
@@ -173,6 +186,10 @@ pub fn workspace_scope() -> Scope {
         .route(web::post().to(post_web_update_handler)),
     )
     .service(
+      web::resource("/{workspace_id}/collab/{object_id}/row-document-collab-exists")
+          .route(web::get().to(get_row_document_collab_exists_handler)),
+    )
+    .service(
       web::resource("/{workspace_id}/collab/{object_id}/embed-info")
         .route(web::get().to(get_collab_embed_info_handler)),
     )
@@ -198,6 +215,14 @@ pub fn workspace_scope() -> Scope {
       web::resource("/{workspace_id}/page-view/{view_id}")
         .route(web::get().to(get_page_view_handler))
         .route(web::patch().to(update_page_view_handler)),
+    )
+    .service(
+      web::resource("/{workspace_id}/page-view/{view_id}/mentionable-person-with-access")
+        .route(web::get().to(list_page_mentionable_person_with_access_handler))
+    )
+    .service(
+      web::resource("/{workspace_id}/page-view/{view_id}/page-mention")
+        .route(web::put().to(put_page_mention_handler))
     )
     .service(
       web::resource("/{workspace_id}/page-view/{view_id}/update-name")
@@ -694,6 +719,118 @@ async fn remove_workspace_member_handler(
   )
   .await?;
 
+  Ok(AppResponse::Ok().into())
+}
+
+#[instrument(skip_all, err)]
+async fn list_workspace_mentionable_person_handler(
+  user_uuid: UserUuid,
+  state: Data<AppState>,
+  path: web::Path<Uuid>,
+) -> Result<JsonAppResponse<MentionablePersons>> {
+  let workspace_id = path.into_inner();
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  // Guest can access mentionable users, but only themselves and the owner
+  state
+    .workspace_access_control
+    .enforce_role_weak(&uid, &workspace_id, AFRole::Guest)
+    .await?;
+  let persons = workspace::ops::list_workspace_mentionable_persons_with_last_mentioned_time(
+    &state.pg_pool,
+    &workspace_id,
+    uid,
+    &user_uuid,
+  )
+  .await?;
+  Ok(
+    AppResponse::Ok()
+      .with_data(MentionablePersons { persons })
+      .into(),
+  )
+}
+
+#[instrument(skip_all, err)]
+async fn list_page_mentionable_person_with_access_handler(
+  user_uuid: UserUuid,
+  state: Data<AppState>,
+  path: web::Path<(Uuid, Uuid)>,
+) -> Result<JsonAppResponse<MentionablePersonsWithAccess>> {
+  let (workspace_id, view_id) = path.into_inner();
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  state
+    .workspace_access_control
+    .enforce_role_weak(&uid, &workspace_id, AFRole::Guest)
+    .await?;
+  let persons = workspace::page_view::list_page_mentionable_persons_with_access(
+    &state.ws_server,
+    &state.pg_pool,
+    &workspace_id,
+    &view_id,
+  )
+  .await?;
+  Ok(
+    AppResponse::Ok()
+      .with_data(MentionablePersonsWithAccess { persons })
+      .into(),
+  )
+}
+
+#[instrument(skip_all, err)]
+async fn put_page_mention_handler(
+  user_uuid: UserUuid,
+  path: web::Path<(Uuid, Uuid)>,
+  state: Data<AppState>,
+  payload: Json<PageMentionUpdate>,
+) -> Result<JsonAppResponse<()>> {
+  let (workspace_id, view_id) = path.into_inner();
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  state
+    .workspace_access_control
+    .enforce_role_weak(&uid, &workspace_id, AFRole::Guest)
+    .await?;
+  workspace::page_view::update_page_mention(
+    &state.pg_pool,
+    &workspace_id,
+    &view_id,
+    uid,
+    &payload.into_inner(),
+  )
+  .await?;
+  Ok(AppResponse::Ok().into())
+}
+
+#[instrument(skip_all, err)]
+async fn get_workspace_mentionable_person_handler(
+  user_uuid: UserUuid,
+  state: Data<AppState>,
+  path: web::Path<(Uuid, Uuid)>,
+) -> Result<JsonAppResponse<MentionablePerson>> {
+  let (workspace_id, person_id) = path.into_inner();
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  state
+    .workspace_access_control
+    .enforce_role_weak(&uid, &workspace_id, AFRole::Guest)
+    .await?;
+  let person =
+    workspace::ops::get_workspace_mentionable_person(&state.pg_pool, &workspace_id, &person_id)
+      .await?;
+  Ok(AppResponse::Ok().with_data(person).into())
+}
+
+async fn put_workspace_member_profile_handler(
+  user_uuid: UserUuid,
+  path: web::Path<Uuid>,
+  payload: Json<WorkspaceMemberProfile>,
+  state: Data<AppState>,
+) -> Result<JsonAppResponse<()>> {
+  let workspace_id = path.into_inner();
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  state
+    .workspace_access_control
+    .enforce_role_weak(&uid, &workspace_id, AFRole::Guest)
+    .await?;
+  let updated_profile = payload.into_inner();
+  update_workspace_member_profile(&state.pg_pool, &workspace_id, uid, &updated_profile).await?;
   Ok(AppResponse::Ok().into())
 }
 
@@ -1216,6 +1353,28 @@ async fn post_web_update_handler(
   )
   .await?;
   Ok(Json(AppResponse::Ok()))
+}
+
+#[instrument(level = "debug", skip_all)]
+async fn get_row_document_collab_exists_handler(
+  user_uuid: UserUuid,
+  path: web::Path<(Uuid, Uuid)>,
+  state: Data<AppState>,
+) -> Result<Json<AppResponse<AFDatabaseRowDocumentCollabExistenceInfo>>> {
+  let uid = state
+    .user_cache
+    .get_user_uid(&user_uuid)
+    .await
+    .map_err(AppResponseError::from)?;
+  let (workspace_id, object_id) = path.into_inner();
+  state
+    .collab_access_control
+    .enforce_action(&workspace_id, &uid, &object_id, Action::Read)
+    .await?;
+  let exists = check_if_row_document_collab_exists(&state.pg_pool, &object_id).await?;
+  Ok(Json(AppResponse::Ok().with_data(
+    AFDatabaseRowDocumentCollabExistenceInfo { exists },
+  )))
 }
 
 async fn post_space_handler(

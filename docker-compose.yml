@@ -46,9 +46,6 @@ services:
 
   gotrue:
     restart: always
-    build:
-      context: docker/gotrue
-      dockerfile: Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
@@ -140,11 +137,6 @@ services:
       - AI_SERVER_PORT=${AI_SERVER_PORT}
       - AI_OPENAI_API_KEY=${AI_OPENAI_API_KEY}
       - APPFLOWY_WEB_URL=${APPFLOWY_WEB_URL}
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        FEATURES: ""
     image: appflowyinc/appflowy_cloud:${APPFLOWY_CLOUD_VERSION:-latest}
     depends_on:
       gotrue:
@@ -152,9 +144,6 @@ services:
 
   admin_frontend:
     restart: always
-    build:
-      context: .
-      dockerfile: ./admin_frontend/Dockerfile
     image: appflowyinc/admin_frontend:${APPFLOWY_ADMIN_FRONTEND_VERSION:-latest}
     environment:
       - RUST_LOG=${RUST_LOG:-info}
@@ -168,24 +157,43 @@ services:
       appflowy_cloud:
         condition: service_started
 
-  #  ai:
-  #    restart: always
-  #    image: appflowyinc/appflowy_ai:${APPFLOWY_AI_VERSION:-latest}
-  #    environment:
-  #      - OPENAI_API_KEY=${AI_OPENAI_API_KEY}
-  #      - APPFLOWY_AI_SERVER_PORT=${AI_SERVER_PORT}
-  #      - APPFLOWY_AI_DATABASE_URL=${AI_DATABASE_URL}
-  #      - APPFLOWY_AI_REDIS_URL=${AI_REDIS_URL}
-  #    depends_on:
-  #      postgres:
-  #        condition: service_healthy
+
+  # ai:
+  #   restart: on-failure
+  #   image: appflowyinc/appflowy_ai:${APPFLOWY_AI_VERSION:-latest}
+  #   environment:
+  #     - AI_SERVER_PORT=${AI_SERVER_PORT}
+  #     - OPENAI_API_KEY=${AI_OPENAI_API_KEY}
+  #     - DEFAULT_AI_MODEL=gpt-4.1-mini # Make sure the model is available in your OpenAI account
+  #     - DEFAULT_AI_COMPLETION_MODEL=gpt-4.1-mini # Make sure the model is available in your OpenAI account
+  #     - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
+  #     - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
+  #     - AZURE_OPENAI_API_VERSION=${AZURE_OPENAI_API_VERSION}
+  #     - APPFLOWY_S3_ACCESS_KEY=${APPFLOWY_S3_ACCESS_KEY}
+  #     - APPFLOWY_S3_SECRET_KEY=${APPFLOWY_S3_SECRET_KEY}
+  #     - APPFLOWY_S3_BUCKET=${APPFLOWY_S3_BUCKET}
+  #     - APPFLOWY_S3_REGION=${APPFLOWY_S3_REGION}
+  #     - AI_DATABASE_URL=${APPFLOWY_DATABASE_URL}
+  #     - AI_REDIS_URL=${APPFLOWY_REDIS_URI}
+  #     - AI_USE_MINIO=${APPFLOWY_S3_USE_MINIO}
+  #     - AI_MINIO_URL=${APPFLOWY_S3_MINIO_URL}
+  #     - AI_APPFLOWY_HOST=${APPFLOWY_BASE_URL}
+  #     - APPFLOWY_GOTRUE_JWT_SECRET=${GOTRUE_JWT_SECRET}
+  #   healthcheck:
+  #     test: [ "CMD", "curl", "-f", "http://localhost:5001/health" ]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #     start_period: 40s
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     appflowy_cloud:
+  #       condition: service_started
 
   appflowy_worker:
     restart: always
     image: appflowyinc/appflowy_worker:${APPFLOWY_WORKER_VERSION:-latest}
-    build:
-      context: .
-      dockerfile: ./services/appflowy-worker/Dockerfile
     environment:
       - RUST_LOG=${RUST_LOG:-info}
       - APPFLOWY_ENVIRONMENT=production
@@ -215,6 +223,10 @@ services:
     image: appflowyinc/appflowy_web:${APPFLOWY_WEB_VERSION:-latest}
     depends_on:
       - appflowy_cloud
+    environment:
+      - APPFLOWY_BASE_URL=${APPFLOWY_BASE_URL}
+      - APPFLOWY_GOTRUE_BASE_URL=${APPFLOWY_BASE_URL}/gotrue
+      - APPFLOWY_WS_BASE_URL=${APPFLOWY_WEBSOCKET_BASE_URL}
 volumes:
   postgres_data:
   minio_data:

@@ -1,4 +1,6 @@
-use database_entity::dto::AFWorkspaceSettingsChange;
+use database_entity::dto::{
+  AFWorkspaceSettingsChange, MentionablePerson, MentionablePersonWithLastMentionedTime,
+};
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Context};
@@ -22,7 +24,7 @@ use database::user::select_uid_from_email;
 use database::workspace::*;
 use database_entity::dto::{
   AFRole, AFWorkspace, AFWorkspaceInvitation, AFWorkspaceInvitationStatus, AFWorkspaceSettings,
-  GlobalComment, Reaction, WorkspaceUsage,
+  GlobalComment, Reaction, WorkspaceMemberProfile, WorkspaceUsage,
 };
 
 use crate::biz::authentication::jwt::OptionalUserUuid;
@@ -734,4 +736,70 @@ pub async fn num_pending_task(uid: i64, pg_pool: &PgPool) -> Result<i64, AppErro
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to query pending tasks: {:?}", e)))?;
 
   Ok(count)
+}
+
+pub async fn list_workspace_mentionable_persons(
+  pg_pool: &PgPool,
+  workspace_id: &Uuid,
+  _uid: i64,
+  _user_uuid: &Uuid,
+) -> Result<Vec<MentionablePerson>, AppError> {
+  let mentionable_workspace_members_or_guests =
+    select_workspace_mentionable_members_or_guests(pg_pool, workspace_id).await?;
+  // TODO: if user is guest, we should not return the contact list
+  // let is_guest = get_workspace_member(uid, pg_pool, workspace_id).await?.role == AFRole::Guest;
+  let mut persons = vec![];
+  persons.extend(
+    mentionable_workspace_members_or_guests
+      .into_iter()
+      .map(|row| row.into()),
+  );
+  Ok(persons)
+}
+
+pub async fn list_workspace_mentionable_persons_with_last_mentioned_time(
+  pg_pool: &PgPool,
+  workspace_id: &Uuid,
+  _uid: i64,
+  _user_uuid: &Uuid,
+) -> Result<Vec<MentionablePersonWithLastMentionedTime>, AppError> {
+  let mentionable_workspace_members_or_guests =
+    select_workspace_mentionable_members_or_guests_with_last_mentioned_time(pg_pool, workspace_id)
+      .await?;
+  // TODO: if user is guest, we should not return the contact list
+  // let is_guest = get_workspace_member(uid, pg_pool, workspace_id).await?.role == AFRole::Guest;
+  let mut persons = vec![];
+  persons.extend(
+    mentionable_workspace_members_or_guests
+      .into_iter()
+      .map(|row| row.into()),
+  );
+  Ok(persons)
+}
+
+pub async fn get_workspace_mentionable_person(
+  pg_pool: &PgPool,
+  workspace_id: &Uuid,
+  person_id: &Uuid,
+) -> Result<MentionablePerson, AppError> {
+  let mentionable_workspace_members_or_guests =
+    select_workspace_mentionable_member_or_guest_by_uuid(pg_pool, workspace_id, person_id).await?;
+  if let Some(mentionable) = mentionable_workspace_members_or_guests {
+    Ok(mentionable.into())
+  } else {
+    Err(AppError::RecordNotFound(format!(
+      "person with ID {} is neither a workspace member nor contact",
+      person_id
+    )))
+  }
+}
+
+pub async fn update_workspace_member_profile(
+  pg_pool: &PgPool,
+  workspace_id: &Uuid,
+  uid: i64,
+  updated_profile: &WorkspaceMemberProfile,
+) -> Result<(), AppError> {
+  upsert_workspace_member_profile(pg_pool, workspace_id, uid, updated_profile).await?;
+  Ok(())
 }

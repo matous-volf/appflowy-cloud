@@ -453,6 +453,11 @@ pub struct QueryWorkspaceMember {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct AFDatabaseRowDocumentCollabExistenceInfo {
+  pub exists: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AFCollabEmbedInfo {
   pub object_id: Uuid,
   /// The timestamp when the object's embeddings updated
@@ -1178,6 +1183,23 @@ pub struct AvatarImageSource {
   pub file_id: String,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+pub struct UserImageAssetSource {
+  pub file_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct UserImageAssetContent {
+  pub data: Vec<u8>,
+  pub content_type: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AvatarContent {
+  pub data: Vec<u8>,
+  pub content_type: String,
+}
+
 #[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug, Copy, Clone)]
 #[repr(i32)]
 pub enum AccessRequestStatus {
@@ -1311,6 +1333,165 @@ pub struct InvitationCodeInfo {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct JoinWorkspaceByInviteCodeParams {
   pub code: String,
+}
+
+pub struct MentionableWorkspaceMemberOrGuest {
+  pub uuid: Uuid,
+  pub name: String,
+  pub email: String,
+  pub role: AFRole,
+  pub avatar_url: Option<String>,
+  pub cover_image_url: Option<String>,
+  pub custom_image_url: Option<String>,
+  pub description: Option<String>,
+}
+
+impl From<MentionableWorkspaceMemberOrGuest> for MentionablePerson {
+  fn from(val: MentionableWorkspaceMemberOrGuest) -> Self {
+    MentionablePerson {
+      uuid: val.uuid,
+      name: val.name,
+      email: val.email,
+      role: match val.role {
+        AFRole::Owner => MentionablePersonType::WorkspaceMember,
+        AFRole::Member => MentionablePersonType::WorkspaceMember,
+        AFRole::Guest => MentionablePersonType::WorkspaceGuest,
+      },
+      avatar_url: val.avatar_url,
+      cover_image_url: val.cover_image_url,
+      custom_image_url: val.custom_image_url,
+      description: val.description,
+      invited: false,
+    }
+  }
+}
+
+pub struct MentionableWorkspaceMemberOrGuestWithLastMentionedTime {
+  pub uuid: Uuid,
+  pub name: String,
+  pub email: String,
+  pub role: AFRole,
+  pub avatar_url: Option<String>,
+  pub cover_image_url: Option<String>,
+  pub custom_image_url: Option<String>,
+  pub description: Option<String>,
+  pub last_mentioned_at: Option<DateTime<Utc>>,
+}
+
+impl From<MentionableWorkspaceMemberOrGuestWithLastMentionedTime>
+  for MentionablePersonWithLastMentionedTime
+{
+  fn from(val: MentionableWorkspaceMemberOrGuestWithLastMentionedTime) -> Self {
+    MentionablePersonWithLastMentionedTime {
+      uuid: val.uuid,
+      name: val.name,
+      email: val.email,
+      role: match val.role {
+        AFRole::Owner => MentionablePersonType::WorkspaceMember,
+        AFRole::Member => MentionablePersonType::WorkspaceMember,
+        AFRole::Guest => MentionablePersonType::WorkspaceGuest,
+      },
+      avatar_url: val.avatar_url,
+      cover_image_url: val.cover_image_url,
+      custom_image_url: val.custom_image_url,
+      description: val.description,
+      invited: false,
+      last_mentioned_at: val.last_mentioned_at,
+    }
+  }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct WorkspaceMemberProfile {
+  pub name: String,
+  pub avatar_url: Option<String>,
+  pub cover_image_url: Option<String>,
+  pub custom_image_url: Option<String>,
+  pub description: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct MentionablePerson {
+  pub uuid: Uuid,
+  pub name: String,
+  pub email: String,
+  pub role: MentionablePersonType,
+  pub avatar_url: Option<String>,
+  pub cover_image_url: Option<String>,
+  pub custom_image_url: Option<String>,
+  pub description: Option<String>,
+  pub invited: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct MentionablePersonWithLastMentionedTime {
+  pub uuid: Uuid,
+  pub name: String,
+  pub email: String,
+  pub role: MentionablePersonType,
+  pub avatar_url: Option<String>,
+  pub cover_image_url: Option<String>,
+  pub custom_image_url: Option<String>,
+  pub description: Option<String>,
+  pub invited: bool,
+  pub last_mentioned_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct MentionablePersonWithAccess {
+  #[serde(flatten)]
+  pub person: MentionablePerson,
+  pub can_access_page: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct MentionablePersons {
+  pub persons: Vec<MentionablePersonWithLastMentionedTime>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct MentionablePersonsWithAccess {
+  pub persons: Vec<MentionablePersonWithAccess>,
+}
+
+#[derive(Serialize_repr, Deserialize_repr, Debug)]
+#[repr(u8)]
+pub enum MentionablePersonType {
+  WorkspaceMember = 1,
+  WorkspaceGuest = 2,
+  Contact = 3,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PageMentionUpdate {
+  pub person_id: Uuid,
+  pub block_id: Option<String>,
+  pub require_notification: bool,
+  // Client to provide view name as, at the time that the mention is created,
+  // the view might not have been in sync with the server side copy of the folder collab.
+  // In addition, we want to capture the view name at the time of the mention creation, in case
+  // it gets modified/deleted afterwards.
+  pub view_name: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PageMentionNotification {
+  pub workspace_name: String,
+  pub workspace_id: Uuid,
+  pub view_id: Uuid,
+  pub view_name: String,
+  pub mentioner_name: String,
+  pub mentioner_avatar_url: Option<String>,
+  pub mentioned_at: DateTime<Utc>,
+  pub mentioned_person_id: Uuid,
+  pub mentioned_person_name: String,
+  pub mentioned_person_email: String,
+  pub block_id: Option<String>,
+}
+
+pub struct ProcessedPageMentionNotification {
+  pub view_id: Uuid,
+  pub person_id: Uuid,
 }
 
 #[cfg(test)]
