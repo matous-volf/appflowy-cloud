@@ -21,6 +21,11 @@ services:
       - MINIO_ROOT_USER=${APPFLOWY_S3_ACCESS_KEY:-minioadmin}
       - MINIO_ROOT_PASSWORD=${APPFLOWY_S3_SECRET_KEY:-minioadmin}
     command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
     volumes:
       - minio_data:/data
 
@@ -115,7 +120,6 @@ services:
       - APPFLOWY_DATABASE_URL=${APPFLOWY_DATABASE_URL}
       - APPFLOWY_REDIS_URI=${APPFLOWY_REDIS_URI}
       - APPFLOWY_GOTRUE_JWT_SECRET=${GOTRUE_JWT_SECRET}
-      - APPFLOWY_GOTRUE_JWT_EXP=${GOTRUE_JWT_EXP}
       - APPFLOWY_GOTRUE_BASE_URL=${APPFLOWY_GOTRUE_BASE_URL}
       - APPFLOWY_S3_CREATE_BUCKET=${APPFLOWY_S3_CREATE_BUCKET}
       - APPFLOWY_S3_USE_MINIO=${APPFLOWY_S3_USE_MINIO}
@@ -137,7 +141,13 @@ services:
       - AI_SERVER_PORT=${AI_SERVER_PORT}
       - AI_OPENAI_API_KEY=${AI_OPENAI_API_KEY}
       - APPFLOWY_WEB_URL=${APPFLOWY_WEB_URL}
+      - APPFLOWY_BASE_URL=${APPFLOWY_BASE_URL}
     image: appflowyinc/appflowy_cloud:${APPFLOWY_CLOUD_VERSION:-latest}
+    healthcheck:
+      test: "curl --fail http://127.0.0.1:8000/api/health || exit 1"
+      interval: 5s
+      timeout: 5s
+      retries: 12
     depends_on:
       gotrue:
         condition: service_healthy
@@ -146,50 +156,47 @@ services:
     restart: always
     image: appflowyinc/admin_frontend:${APPFLOWY_ADMIN_FRONTEND_VERSION:-latest}
     environment:
-      - RUST_LOG=${RUST_LOG:-info}
-      - ADMIN_FRONTEND_REDIS_URL=${ADMIN_FRONTEND_REDIS_URL:-redis://redis:6379}
-      - ADMIN_FRONTEND_GOTRUE_URL=${ADMIN_FRONTEND_GOTRUE_URL:-http://gotrue:9999}
-      - ADMIN_FRONTEND_APPFLOWY_CLOUD_URL=${ADMIN_FRONTEND_APPFLOWY_CLOUD_URL:-http://appflowy_cloud:8000}
-      - ADMIN_FRONTEND_PATH_PREFIX=${ADMIN_FRONTEND_PATH_PREFIX:-}
+      - APPFLOWY_GOTRUE_BASE_URL=${APPFLOWY_BASE_URL}/gotrue
+      - APPFLOWY_BASE_URL=${APPFLOWY_BASE_URL}
+      
     depends_on:
       gotrue:
         condition: service_healthy
       appflowy_cloud:
-        condition: service_started
+        condition: service_healthy
 
-
-  # ai:
-  #   restart: on-failure
-  #   image: appflowyinc/appflowy_ai:${APPFLOWY_AI_VERSION:-latest}
-  #   environment:
-  #     - AI_SERVER_PORT=${AI_SERVER_PORT}
-  #     - OPENAI_API_KEY=${AI_OPENAI_API_KEY}
-  #     - DEFAULT_AI_MODEL=gpt-4.1-mini # Make sure the model is available in your OpenAI account
-  #     - DEFAULT_AI_COMPLETION_MODEL=gpt-4.1-mini # Make sure the model is available in your OpenAI account
-  #     - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
-  #     - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
-  #     - AZURE_OPENAI_API_VERSION=${AZURE_OPENAI_API_VERSION}
-  #     - APPFLOWY_S3_ACCESS_KEY=${APPFLOWY_S3_ACCESS_KEY}
-  #     - APPFLOWY_S3_SECRET_KEY=${APPFLOWY_S3_SECRET_KEY}
-  #     - APPFLOWY_S3_BUCKET=${APPFLOWY_S3_BUCKET}
-  #     - APPFLOWY_S3_REGION=${APPFLOWY_S3_REGION}
-  #     - AI_DATABASE_URL=${APPFLOWY_DATABASE_URL}
-  #     - AI_REDIS_URL=${APPFLOWY_REDIS_URI}
-  #     - AI_USE_MINIO=${APPFLOWY_S3_USE_MINIO}
-  #     - AI_MINIO_URL=${APPFLOWY_S3_MINIO_URL}
-  #     - AI_APPFLOWY_HOST=${APPFLOWY_BASE_URL}
-  #     - APPFLOWY_GOTRUE_JWT_SECRET=${GOTRUE_JWT_SECRET}
-  #   healthcheck:
-  #     test: [ "CMD", "curl", "-f", "http://localhost:5001/health" ]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 3
-  #     start_period: 40s
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #     appflowy_cloud:
-  #       condition: service_started
+#  ai:
+#    restart: on-failure
+#    image: appflowyinc/appflowy_ai:${APPFLOWY_AI_VERSION:-latest}
+#    environment:
+#      - AI_SERVER_PORT=${AI_SERVER_PORT}
+#      - OPENAI_API_KEY=${AI_OPENAI_API_KEY}
+#      - DEFAULT_AI_MODEL=gpt-4.1-mini # Make sure the model is available in your OpenAI account
+#      - DEFAULT_AI_COMPLETION_MODEL=gpt-4.1-mini # Make sure the model is available in your OpenAI account
+#      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
+#      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
+#      - AZURE_OPENAI_API_VERSION=${AZURE_OPENAI_API_VERSION}
+#      - APPFLOWY_S3_ACCESS_KEY=${APPFLOWY_S3_ACCESS_KEY}
+#      - APPFLOWY_S3_SECRET_KEY=${APPFLOWY_S3_SECRET_KEY}
+#      - APPFLOWY_S3_BUCKET=${APPFLOWY_S3_BUCKET}
+#      - APPFLOWY_S3_REGION=${APPFLOWY_S3_REGION}
+#      - AI_DATABASE_URL=${APPFLOWY_DATABASE_URL}
+#      - AI_REDIS_URL=${APPFLOWY_REDIS_URI}
+#      - AI_USE_MINIO=${APPFLOWY_S3_USE_MINIO}
+#      - AI_MINIO_URL=${APPFLOWY_S3_MINIO_URL}
+#      - AI_APPFLOWY_HOST=${APPFLOWY_BASE_URL}
+#      - APPFLOWY_GOTRUE_JWT_SECRET=${GOTRUE_JWT_SECRET}
+#    healthcheck:
+#      test: [ "CMD", "curl", "-f", "http://localhost:5001/health" ]
+#      interval: 30s
+#      timeout: 10s
+#      retries: 3
+#      start_period: 40s
+#    depends_on:
+#      postgres:
+#        condition: service_healthy
+#      appflowy_cloud:
+#        condition: service_healthy
 
   appflowy_worker:
     restart: always
@@ -217,12 +224,15 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      appflowy_cloud:
+        condition: service_healthy
 
   appflowy_web:
     restart: always
     image: appflowyinc/appflowy_web:${APPFLOWY_WEB_VERSION:-latest}
     depends_on:
-      - appflowy_cloud
+      appflowy_cloud:
+        condition: service_healthy
     environment:
       - APPFLOWY_BASE_URL=${APPFLOWY_BASE_URL}
       - APPFLOWY_GOTRUE_BASE_URL=${APPFLOWY_BASE_URL}/gotrue
