@@ -22,7 +22,7 @@ services:
       - MINIO_ROOT_PASSWORD=${APPFLOWY_S3_SECRET_KEY:-minioadmin}
     command: server /data --console-address ":9001"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
       interval: 30s
       timeout: 20s
       retries: 3
@@ -37,8 +37,10 @@ services:
       - POSTGRES_DB=${POSTGRES_DB:-postgres}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
       - POSTGRES_HOST=${POSTGRES_HOST:-postgres}
+      - PGPORT=${POSTGRES_PORT:-5432}
+    command: [ "postgres", "-c", "port=${POSTGRES_PORT:-5432}" ]
     healthcheck:
-      test: [ "CMD", "pg_isready", "-U", "${POSTGRES_USER}", "-d", "${POSTGRES_DB}" ]
+      test: [ "CMD", "pg_isready", "-U", "${POSTGRES_USER}", "-d", "${POSTGRES_DB}", "-p", "${POSTGRES_PORT:-5432}" ]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -59,6 +61,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 12
+      start_period: 40s
     image: appflowyinc/gotrue:${GOTRUE_VERSION:-latest}
     environment:
       # There are a lot of options to configure GoTrue. You can reference the example config:
@@ -142,6 +145,11 @@ services:
       - AI_OPENAI_API_KEY=${AI_OPENAI_API_KEY}
       - APPFLOWY_WEB_URL=${APPFLOWY_WEB_URL}
       - APPFLOWY_BASE_URL=${APPFLOWY_BASE_URL}
+      - ASSEMBLYAI_API_KEY=${ASSEMBLYAI_API_KEY}
+      - ASSEMBLYAI_API_BASE=${ASSEMBLYAI_API_BASE}
+      - ASSEMBLYAI_STREAMING_API_BASE=${ASSEMBLYAI_STREAMING_API_BASE}
+      - APPFLOWY_SEARCH_SERVICE_URL=${APPFLOWY_SEARCH_SERVICE_URL:-http://appflowy_search:4002}
+      - APPFLOWY_SEARCH_REQUEST_TIMEOUT_SECS=${APPFLOWY_SEARCH_REQUEST_TIMEOUT_SECS:-10}
     image: appflowyinc/appflowy_cloud:${APPFLOWY_CLOUD_VERSION:-latest}
     healthcheck:
       test: "curl --fail http://127.0.0.1:8000/api/health || exit 1"
@@ -158,7 +166,7 @@ services:
     environment:
       - APPFLOWY_GOTRUE_BASE_URL=${APPFLOWY_BASE_URL}/gotrue
       - APPFLOWY_BASE_URL=${APPFLOWY_BASE_URL}
-      
+
     depends_on:
       gotrue:
         condition: service_healthy
@@ -227,6 +235,32 @@ services:
       appflowy_cloud:
         condition: service_healthy
 
+  appflowy_search:
+    restart: on-failure
+    image: appflowyinc/appflowy_search:${APPFLOWY_SEARCH_VERSION:-latest}
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - APPFLOWY_SEARCH_HOST=${APPFLOWY_SEARCH_HOST:-[::]}
+      - APPFLOWY_SEARCH_PORT=${APPFLOWY_SEARCH_PORT:-4002}
+      - APPFLOWY_SEARCH_DATABASE_URL=${APPFLOWY_DATABASE_URL}
+      - APPFLOWY_SEARCH_REDIS_URL=${APPFLOWY_REDIS_URI}
+      - AI_OPENAI_API_KEY=${AI_OPENAI_API_KEY}
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
+      - AZURE_OPENAI_API_VERSION=${AZURE_OPENAI_API_VERSION}
+      - APPFLOWY_BACKGROUND_INDEXER_ENABLED=true
+      - APPFLOWY_INDEXER_DATABASE_ENABLED=${APPFLOWY_INDEXER_DATABASE_ENABLED:-false}
+      - APPFLOWY_KEYWORD_SEARCH_ENABLED=${APPFLOWY_KEYWORD_SEARCH_ENABLED:-true}
+      - APPFLOWY_KEYWORD_WORKER_ENABLED=true
+      - APPFLOWY_KEYWORD_INDEX_MAP_SIZE_BYTES=${APPFLOWY_KEYWORD_INDEX_MAP_SIZE_BYTES:-2147483648}
+      - APPFLOWY_KEYWORD_INDEX_DIR=${APPFLOWY_KEYWORD_INDEX_DIR:-/var/lib/appflowy/keyword_index}
+      - APPFLOWY_GOTRUE_JWT_SECRET=${GOTRUE_JWT_SECRET}
+    volumes:
+      - keyword_index_data:/var/lib/appflowy/keyword_index
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   appflowy_web:
     restart: always
     image: appflowyinc/appflowy_web:${APPFLOWY_WEB_VERSION:-latest}
@@ -240,6 +274,7 @@ services:
 volumes:
   postgres_data:
   minio_data:
+  keyword_index_data:
 
 networks:
   web-server-network:
