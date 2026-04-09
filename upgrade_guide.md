@@ -11,6 +11,8 @@
    
 4. Merge the new version's tag into the `selfhosted` branch (ideally in an IDE). UPDATE: It seems AppFlowy cloud no longer utilizes tags for new releases, so just merge the `main` branch.
 
+5. Check changes in the `.env` file manully, since it is ignored from Git.
+
 5. Push to the origin.
 
 6. On the server, pull from the origin.
